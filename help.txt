@@ -3,3 +3,4 @@ Aria is stil within beta so expect lots of ISSUES.
 Instructions:
 Run requirements.py
 And then run ariaagent.py.
+If readme.md doesn't work try to replace "python" with "python3".
