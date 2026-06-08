@@ -1,2 +1,2 @@
-After doing this, make sure you pulled ollama and then run the script.
+After doing this, make sure you pulled ollama and downloaded the model. and then run the script.
 Aria is stil within beta so expect lots of ISSUES.
