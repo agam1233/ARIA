@@ -152,7 +152,7 @@ DEFAULT_CFG = {
     "danger_confirm": True,
 }
 cfg = dict(DEFAULT_CFG)
-
+#no, github copilot i didnt remove a comment
 def load_config():
     global cfg
     if CONFIG_FILE.exists():
