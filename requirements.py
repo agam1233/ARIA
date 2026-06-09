@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ARIA Full Bootstrap Installer
+ARIA Full Bootstrap Installer (Cross-Platform)
 - installs python deps
-- installs Ollama (if missing)
+- installs Ollama (Windows/Linux/macOS safe)
 - starts Ollama
 - pulls qwen3.5:9b
 """
@@ -28,26 +28,29 @@ def run(cmd):
     print(f"\n$ {cmd}")
     return subprocess.call(cmd, shell=True)
 
+
 def check_python(pkg):
     try:
         __import__(pkg)
         return True
-    except:
+    except ImportError:
         return False
+
 
 def pip_install(pkg):
     run(f"{sys.executable} -m pip install {pkg}")
+
 
 def has_cmd(cmd):
     return shutil.which(cmd) is not None
 
 
 # ─────────────────────────────────────────────
-# install ollama
+# install ollama (CROSS PLATFORM FIXED)
 # ─────────────────────────────────────────────
 
 def install_ollama():
-    print("\n🔥 Installing Ollama...")
+    print("\n🔥 Checking Ollama installation...")
 
     if has_cmd("ollama"):
         print("✔ Ollama already installed")
@@ -56,11 +59,22 @@ def install_ollama():
     system = platform.system().lower()
 
     if system == "linux":
+        print("🐧 Linux detected")
         run("curl -fsSL https://ollama.com/install.sh | sh")
+
     elif system == "darwin":
+        print("🍎 macOS detected")
         run("brew install ollama")
+
+    elif system == "windows":
+        print("🪟 Windows detected")
+        print("\n⚠ Ollama must be installed manually on Windows:")
+        print("👉 Option 1: winget install Ollama.Ollama")
+        print("👉 Option 2: Download from https://ollama.com")
+        input("\nPress ENTER after installing Ollama...")
+
     else:
-        print("❌ Unsupported OS for auto install")
+        print("❌ Unsupported OS")
         sys.exit(1)
 
 
@@ -71,13 +85,20 @@ def install_ollama():
 def start_ollama():
     print("\n🧠 Starting Ollama server...")
 
-    if has_cmd("ollama"):
-        # try background start
-        subprocess.Popen(["ollama", "serve"],
-                         stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+    if not has_cmd("ollama"):
+        print("❌ Ollama not found in PATH")
+        return
+
+    try:
+        subprocess.Popen(
+            ["ollama", "serve"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        )
         time.sleep(3)
         print("✔ Ollama launch attempted")
+    except Exception as e:
+        print(f"⚠ Failed to start Ollama: {e}")
 
 
 # ─────────────────────────────────────────────
@@ -97,7 +118,7 @@ def pull_model():
 
 
 # ─────────────────────────────────────────────
-# verify ollama
+# check ollama alive
 # ─────────────────────────────────────────────
 
 def check_ollama_alive():
@@ -105,7 +126,7 @@ def check_ollama_alive():
         import requests
         r = requests.get(OLLAMA_URL, timeout=3)
         return r.status_code < 500
-    except:
+    except Exception:
         return False
 
 
@@ -116,7 +137,7 @@ def check_ollama_alive():
 def main():
     print("\n🚀 ARIA FULL SYSTEM BOOTSTRAP 🚀\n")
 
-    # python deps
+    # Python deps
     print("📦 Checking Python dependencies...")
     for pkg in REQUIRED_PY:
         if not check_python(pkg):
@@ -125,13 +146,13 @@ def main():
         else:
             print(f"✔ {pkg}")
 
-    # ollama install
+    # Ollama install
     install_ollama()
 
-    # start ollama
+    # Start Ollama
     start_ollama()
 
-    # wait for server
+    # Wait for server
     print("\n⏳ Waiting for Ollama...")
     for _ in range(10):
         if check_ollama_alive():
@@ -141,9 +162,11 @@ def main():
     else:
         print("⚠ Ollama not responding but continuing...")
 
-    # pull model
+    # Pull model
     pull_model()
-print("Qwen3.5 9B succesfully pulled. Run ariaagent.py using python3 ariaagent.py")
+
+    print("\n🎉 SETUP COMPLETE 🎉")
+    print("Run: python3 ariaagent.py")
 
 
 if __name__ == "__main__":
