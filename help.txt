@@ -4,3 +4,4 @@ Instructions:
 Run requirements.py
 And then run ariaagent.py.
 If readme.md doesn't work try to replace "python" with "python3".
+Note: If you need to update, re-run README.md
