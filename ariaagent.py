@@ -23,7 +23,7 @@ except ImportError:
 #  VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION       = " Build 2 Beta X"
+VERSION       = " BETA 0.10"
 DEFAULT_MODEL = "qwen3.5:9b"
 OLLAMA_BASE   = "http://localhost:11434"
 CHAT_URL      = f"{OLLAMA_BASE}/api/chat"
