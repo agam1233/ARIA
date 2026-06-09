@@ -50,7 +50,7 @@ def has_cmd(cmd):
 # ─────────────────────────────────────────────
 
 def install_ollama():
-    print("\n🔥 Checking Ollama installation...")
+    print("\n Checking if you have ollama.")
 
     if has_cmd("ollama"):
         print("✔ Ollama already installed")
@@ -135,10 +135,10 @@ def check_ollama_alive():
 # ─────────────────────────────────────────────
 
 def main():
-    print("\n🚀 ARIA FULL SYSTEM BOOTSTRAP 🚀\n")
+    print("\nBootstrapper\n")
 
     # Python deps
-    print("📦 Checking Python dependencies...")
+    print(" Checking Python deps")
     for pkg in REQUIRED_PY:
         if not check_python(pkg):
             print(f"Missing: {pkg}")
@@ -153,7 +153,7 @@ def main():
     start_ollama()
 
     # Wait for server
-    print("\n⏳ Waiting for Ollama...")
+    print("\n Waiting for Ollama...")
     for _ in range(10):
         if check_ollama_alive():
             print("✔ Ollama is running")
