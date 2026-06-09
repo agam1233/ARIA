@@ -23,7 +23,7 @@ except ImportError:
 #  VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION       = " Build X1"
+VERSION       = " Build 2 Beta X"
 DEFAULT_MODEL = "qwen3.5:9b"
 OLLAMA_BASE   = "http://localhost:11434"
 CHAT_URL      = f"{OLLAMA_BASE}/api/chat"
@@ -363,20 +363,38 @@ def change_directory(path):
 def search_web(query):
     if not cfg["allow_network"]: return "Network disabled", False
     try:
-        url  = "https://lite.duckduckgo.com/lite/"
-        resp = requests.post(url, data={"q": query, "d": "on"}, timeout=10,
-                             headers={"User-Agent": "ARIA/6.0"})
+        import urllib.parse
+        import html
+        
+        # Use html.duckduckgo for more predictable DOM and spoof a standard browser
+        url = "https://html.duckduckgo.com/html/"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+        
+        resp = requests.post(url, data={"q": query}, timeout=15, headers=headers)
         resp.raise_for_status()
-        results, lines = [], resp.text.splitlines()
-        for i, line in enumerate(lines):
-            if "result-link" in line.lower() and i+2 < len(lines):
-                title = re.sub(r'<[^>]+>', '', lines[i+1]).strip()
-                url_m = re.search(r'href="([^"]+)"', lines[i+2])
-                if url_m:
-                    results.append(f"{title}\n  {url_m.group(1)}")
-                if len(results) >= cfg["search_n"]: break
-        out = "\n\n".join(results) if results else "No results"
+
+        results = []
+        # Use finditer to search across the entire HTML string, ignoring line breaks
+        pattern = r'<a class="result__url" href="([^"]+)".*?>(.*?)</a>'
+        
+        for match in re.finditer(pattern, resp.text, re.IGNORECASE | re.DOTALL):
+            link = match.group(1)
+            title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
+            title = html.unescape(title)
+
+            # DuckDuckGo wraps links in a redirect tracker; extract the real URL
+            if 'uddg=' in link:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse("http:" + link).query)
+                link = qs.get('uddg', [link])[0]
+
+            results.append(f"{title}\n  {link}")
+            if len(results) >= cfg.get("search_n", 5): break
+            
+        out = "\n\n".join(results) if results else "No results. (HTML structure may have changed or the request was blocked)."
         return out, bool(results)
+        
     except Exception as e:
         return f"Search error: {e}", False
 
