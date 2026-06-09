@@ -288,7 +288,7 @@ def info(m): print(f"  {c(C.BLUE,   '·')}  {c(C.GRAY, m)}")
 def tool_header(icon, tag, detail=""):
     trunc = detail[:70] + ("…" if len(detail) > 70 else "")
     print(f"\n  {c(C.MAGENTA, icon)} {c(C.GRAY+C.DIM, tag+':')} {c(C.WHITE, trunc)}")
-
+#note from the dev, what you doing here?
 def tool_result_box(result, success=True):
     color  = C.DGREEN if success else C.RED
     lines  = result.splitlines()
