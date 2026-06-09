@@ -9,15 +9,21 @@ import datetime
 import shutil
 import threading
 import tempfile
-import readline
+import io
 import difflib
 from pathlib import Path
+
+# Wrap readline to prevent crashes on systems (like Windows) without it
+try:
+    import readline
+except ImportError:
+    readline = None
 
 # ══════════════════════════════════════════════════════════════════════
 #  VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION       = " Build 2 Beta X"
+VERSION       = " Build X1"
 DEFAULT_MODEL = "qwen3.5:9b"
 OLLAMA_BASE   = "http://localhost:11434"
 CHAT_URL      = f"{OLLAMA_BASE}/api/chat"
@@ -93,6 +99,8 @@ def suggest_command(bad_cmd, known_cmds):
 # ══════════════════════════════════════════════════════════════════════
 
 def setup_readline():
+    if readline is None:
+        return
     try:
         if HISTORY_FILE.exists():
             readline.read_history_file(str(HISTORY_FILE))
@@ -102,6 +110,8 @@ def setup_readline():
         pass
 
 def save_readline_history():
+    if readline is None:
+        return
     try:
         readline.write_history_file(str(HISTORY_FILE))
     except Exception:
@@ -146,13 +156,13 @@ cfg = dict(DEFAULT_CFG)
 def load_config():
     global cfg
     if CONFIG_FILE.exists():
-        try: cfg.update(json.loads(CONFIG_FILE.read_text()))
+        try: cfg.update(json.loads(CONFIG_FILE.read_text(encoding='utf-8')))
         except: pass
     for k, v in DEFAULT_CFG.items():
         if k not in cfg: cfg[k] = v
 
 def save_config():
-    try: CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    try: CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
     except: pass
 
 DEFAULT_MEMORY = {
@@ -164,13 +174,13 @@ model_memory = dict(DEFAULT_MEMORY)
 def load_model_memory():
     global model_memory
     if MODEL_MEMORY_FILE.exists():
-        try: model_memory.update(json.loads(MODEL_MEMORY_FILE.read_text()))
+        try: model_memory.update(json.loads(MODEL_MEMORY_FILE.read_text(encoding='utf-8')))
         except: pass
     for k, v in DEFAULT_MEMORY.items():
         if k not in model_memory: model_memory[k] = v
 
 def save_model_memory():
-    try: MODEL_MEMORY_FILE.write_text(json.dumps(model_memory, indent=2))
+    try: MODEL_MEMORY_FILE.write_text(json.dumps(model_memory, indent=2), encoding='utf-8')
     except: pass
 
 def first_time_setup():
@@ -194,7 +204,7 @@ def first_time_setup():
     time.sleep(0.8)
 
 # ══════════════════════════════════════════════════════════════════════
-#  SYSTEM PROMPT  (unchanged per instructions)
+#  SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════════════
 
 def system_prompt():
@@ -216,10 +226,10 @@ Security: Shell={shell_status} | Network={cfg["allow_network"]}
 [TOOLS] – Use ONE tag at a time, wait for result.
 <search>query</search>
 <read>file</read>
+<write file="path">content</write>
 <summarize>file</summarize>
 <http url="URL"/>
 <execute>command</execute>
-(if you need to write a file use touch in execute.)
 <pyeval>python code</pyeval>
 <listdir>path</listdir>
 <glob>pattern</glob>
@@ -376,7 +386,10 @@ def http_fetch(url):
         resp = requests.get(url, timeout=15, headers={"User-Agent": "ARIA/6.0"})
         resp.raise_for_status()
         if 'application/json' in resp.headers.get('content-type', ''):
-            out = json.dumps(resp.json(), indent=2)[:MAX_OUTPUT_LEN]
+            try:
+                out = json.dumps(resp.json(), indent=2)[:MAX_OUTPUT_LEN]
+            except ValueError:
+                out = truncate_output(resp.text)
         else:
             out = truncate_output(resp.text)
         return out, True
@@ -389,7 +402,7 @@ def summarize_file(filepath):
     if p.is_dir():     return f"Error: {filepath} is a directory", False
     stat = p.stat()
     try:
-        with p.open('r', errors='replace') as f:
+        with p.open('r', encoding='utf-8', errors='replace') as f:
             lines = sum(1 for _ in f)
             f.seek(0)
             words = sum(len(l.split()) for l in f)
@@ -397,15 +410,15 @@ def summarize_file(filepath):
         lines = words = -1
     preview = ""
     if 0 < stat.st_size < 50000:
-        preview = "\n\nFirst 20 lines:\n" + "\n".join(p.read_text(errors='replace').splitlines()[:20])
+        preview = "\n\nFirst 20 lines:\n" + "\n".join(p.read_text(encoding='utf-8', errors='replace').splitlines()[:20])
     out = f"File: {p.name}\nSize: {stat.st_size:,} bytes\nLines: {lines:,}\nWords: {words:,}{preview}"
     return out, True
 
 def python_eval(code):
     old_out, old_err = sys.stdout, sys.stderr
     try:
-        sys.stdout = tempfile.StringIO()
-        sys.stderr = tempfile.StringIO()
+        sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
         exec(code, {"__name__": "__aria_exec__"})
         out = sys.stdout.getvalue()
         err_out = sys.stderr.getvalue()
@@ -448,7 +461,7 @@ def grep_file(pattern, filepath):
     p = Path(filepath).expanduser()
     if not p.exists(): return f"Error: {filepath} not found", False
     try:
-        lines   = p.read_text(errors='replace').splitlines()
+        lines   = p.read_text(encoding='utf-8', errors='replace').splitlines()
         results = []
         for i, line in enumerate(lines, 1):
             if re.search(pattern, line, re.IGNORECASE):
@@ -463,12 +476,12 @@ def edit_file(filepath, pattern, replacement):
     p = Path(filepath).expanduser()
     if not p.exists(): return f"Error: {filepath} not found", False
     try:
-        original = p.read_text()
+        original = p.read_text(encoding='utf-8')
         new_content, count = re.subn(pattern, replacement, original)
         if count == 0: return "No matches found", False
         backup = BACKUP_DIR / f"{p.name}_{int(time.time())}.bak"
         shutil.copy(p, backup)
-        p.write_text(new_content)
+        p.write_text(new_content, encoding='utf-8')
         return f"Replaced {count} occurrence(s) in {filepath}\nBackup: {backup.name}", True
     except Exception as e:
         return f"Edit failed: {e}", False
@@ -527,7 +540,7 @@ def write_file(filepath, content):
             backup = BACKUP_DIR / f"{p.name}_{int(time.time())}.bak"
             shutil.copy(p, backup)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
+        p.write_text(content, encoding='utf-8')
         return f"Wrote {len(content):,} chars to {filepath}", True
     except Exception as e:
         return f"Write failed: {e}", False
@@ -537,7 +550,7 @@ def read_file(filepath):
     if not p.exists(): return f"Error: {filepath} not found", False
     if p.is_dir():     return f"Error: {filepath} is a directory", False
     try:
-        content = p.read_text(errors='replace')
+        content = p.read_text(encoding='utf-8', errors='replace')
         return f"Contents of {filepath}:\n\n{truncate_output(content)}", True
     except Exception as e:
         return f"Read error: {e}", False
@@ -561,7 +574,7 @@ def process_tools(text):
         ('execute', run_shell_command,
          r'<execute>(.*?)</execute>', lambda m: m.group(1).strip(), "⚡", "running"),
         ('write', write_file,
-         r'<write\s+file=["\']?([^"\'>\s]+)["\']?[^>]*>(.*?)</write>',
+         r'<write\s+file=["\']([^"\']+)["\'][^>]*>(.*?)</write>',
          lambda m: (m.group(1), m.group(2).strip()), "💾", "reading"),
         ('read', read_file,
          r'<read>(.*?)</read>', lambda m: m.group(1).strip(), "📖", "reading"),
@@ -602,7 +615,7 @@ def process_tools(text):
 
     # edit
     edit_m = re.search(
-        r'<edit\s+file=["\']?([^"\'>\s]+)["\']?\s+pattern=["\']?([^"\'>\s]+)["\']?[^>]*>(.*?)</edit>',
+        r'<edit\s+file=["\']([^"\']+)["\']\s+pattern=["\']([^"\']+)["\'][^>]*>(.*?)</edit>',
         text, re.IGNORECASE | re.DOTALL)
     if edit_m:
         filepath, pattern, replacement = edit_m.group(1), edit_m.group(2), edit_m.group(3)
@@ -616,8 +629,8 @@ def process_tools(text):
         m = re.search(rf'<{tag}\s+([^>]+?)\s*/?>', text, re.IGNORECASE)
         if m:
             attrs = m.group(1)
-            src   = re.search(r'src=["\']?([^"\'>\s]+)', attrs)
-            dst   = re.search(r'dest=["\']?([^"\'>\s]+)', attrs)
+            src   = re.search(r'src=["\']([^"\']+)["\']', attrs)
+            dst   = re.search(r'dest=["\']([^"\']+)["\']', attrs)
             if src and dst:
                 icon = "📦" if tag == "move" else "📋"
                 tool_header(icon, tag, f"{src.group(1)} → {dst.group(1)}")
@@ -763,7 +776,7 @@ def handle_command(cmd):
             "cfg":       cfg,
             "cwd":       os.getcwd()
         }
-        session_file.write_text(json.dumps(session_data, indent=2))
+        session_file.write_text(json.dumps(session_data, indent=2), encoding='utf-8')
         ok(f"Session saved → {session_file.name}")
 
     elif verb == '/load':
@@ -776,7 +789,7 @@ def handle_command(cmd):
         if not sf.exists():
             err("Session file not found"); return
         try:
-            data = json.loads(sf.read_text())
+            data = json.loads(sf.read_text(encoding='utf-8'))
             messages_history[:] = data.get("messages", [])
             cfg.update(data.get("cfg", {}))
             saved_cwd = data.get("cwd")
