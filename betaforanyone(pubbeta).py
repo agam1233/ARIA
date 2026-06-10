@@ -25,7 +25,7 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════
 
 VERSION        = "Build 3 Beta"
-DEFAULT_MODEL  = "qwen3:8b"
+DEFAULT_MODEL  = "qwen3.5:9b"
 OLLAMA_BASE    = "http://localhost:11434"
 CHAT_URL       = f"{OLLAMA_BASE}/api/chat"
 SESSION_DIR    = Path.home() / ".aria_sessions"
