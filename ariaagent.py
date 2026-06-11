@@ -23,7 +23,8 @@ except ImportError:
 #  VERSION & CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
-VERSION       = " BETA 0.10"
+VERSION       = " X 0.1"
+NEWVERSION = "This is a secret message! Soon a new version called 0.25 will be released, with major changes. This will be drastic as the last time we've had a major update was 1-2 days ago.)
 DEFAULT_MODEL = "qwen3.5:9b"
 OLLAMA_BASE   = "http://localhost:11434"
 CHAT_URL      = f"{OLLAMA_BASE}/api/chat"
