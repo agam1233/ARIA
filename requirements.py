@@ -69,8 +69,7 @@ def install_ollama():
     elif system == "windows":
         print("🪟 Windows detected")
         print("\n⚠ Ollama must be installed manually on Windows:")
-        print("👉 Option 1: winget install Ollama.Ollama")
-        print("👉 Option 2: Download from https://ollama.com")
+        print("👉 Option 1: Download ollama manually.")
         input("\nPress ENTER after installing Ollama...")
 
     else:
