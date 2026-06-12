@@ -4,8 +4,8 @@ Aria — Autonomous Reasoning Intelligent Agent. Standalone local AI agent with 
 Run:  python aria.py        (stdlib only, no installs)
 Opens http://127.0.0.1:8400 — tools operate in the launch directory.
 """
-import json, os, re, subprocess, threading, uuid, html as htmlmod
-import urllib.request, urllib.parse, webbrowser
+import json, os, re, ssl, subprocess, threading, uuid, html as htmlmod
+import urllib.request, urllib.parse, urllib.error, webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 8400
@@ -34,7 +34,7 @@ Tools:
 Workspace: {ROOT}
 RULES:
 - NEVER put file content inside JSON — always use the <<write:...>> block for files.
-- NEVER describe a command in prose instead of calling it. NEVER invent tool results.
+- NEVER describe a command in prose instead of calling it.
 - One tool call per reply. When done with tools, write a normal final answer (no JSON, no blocks).
 """.strip()
 
@@ -80,58 +80,78 @@ def t_shell(a):
 def _strip_tags(s):
     return htmlmod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))).strip()
 
+def _fetch(url, data=None, timeout=10):
+    """GET/POST with realistic headers; retries once with relaxed SSL on cert errors."""
+    req = urllib.request.Request(url, data=data, headers={
+        **UA, "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+        **({"Content-Type": "application/x-www-form-urlencoded"} if data else {})})
+    try:
+        return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
+    except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return urllib.request.urlopen(req, timeout=timeout, context=ctx).read().decode("utf-8", "replace")
+        raise
+
 def _ddg_url(href):
     if href.startswith("//"):
         href = "https:" + href
     q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg")
     return urllib.parse.unquote(q[0]) if q else href
 
+def _dedupe(pairs, n=6):
+    out, seen = [], set()
+    for url, title in pairs:
+        if not url.startswith("http") or url in seen:
+            continue
+        seen.add(url)
+        out.append(f"- {_strip_tags(title)}\n  {url}")
+        if len(out) >= n:
+            break
+    return out
+
 def t_search(a):
     query, errs = a["query"], []
+    # 1) DuckDuckGo Lite
     try:
-        data = urllib.parse.urlencode({"q": query}).encode()
-        req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data,
-                                     headers={**UA, "Content-Type": "application/x-www-form-urlencoded"})
-        page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+        page = _fetch("https://lite.duckduckgo.com/lite/",
+                      data=urllib.parse.urlencode({"q": query}).encode())
         hits = re.findall(r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', page, re.S) \
             or re.findall(r'<a rel="nofollow" href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
-        out, seen = [], set()
-        for href, title in hits:
-            url = _ddg_url(href)
-            if not url.startswith("http") or url in seen:
-                continue
-            seen.add(url)
-            out.append(f"- {_strip_tags(title)}\n  {url}")
-            if len(out) >= 6:
-                break
+        out = _dedupe((_ddg_url(h), t) for h, t in hits)
         if out:
             return "\n".join(out)
-        errs.append("lite: 0 results")
+        errs.append("ddg-lite: parsed 0 results (likely bot challenge)")
     except Exception as e:
-        errs.append(f"lite: {e}")
+        errs.append(f"ddg-lite: {type(e).__name__}: {e}")
+    # 2) DuckDuckGo HTML
     try:
-        req = urllib.request.Request(
-            "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query), headers=UA)
-        page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
-        out, seen = [], set()
-        for m in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S):
-            url = _ddg_url(m.group(1))
-            if url in seen:
-                continue
-            seen.add(url)
-            out.append(f"- {_strip_tags(m.group(2))}\n  {url}")
-            if len(out) >= 6:
-                break
+        page = _fetch("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query))
+        hits = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+        out = _dedupe((_ddg_url(h), t) for h, t in hits)
         if out:
             return "\n".join(out)
-        errs.append("html: 0 results")
+        errs.append("ddg-html: parsed 0 results")
     except Exception as e:
-        errs.append(f"html: {e}")
-    return "ERROR: search unavailable (" + "; ".join(errs) + "). Tell the user search failed; do not invent results."
+        errs.append(f"ddg-html: {type(e).__name__}: {e}")
+    # 3) Bing
+    try:
+        page = _fetch("https://www.bing.com/search?q=" + urllib.parse.quote_plus(query))
+        hits = re.findall(r'<h2><a href="(http[^"]+)"[^>]*>(.*?)</a></h2>', page, re.S)
+        out = _dedupe(hits)
+        if out:
+            return "\n".join(out)
+        errs.append("bing: parsed 0 results")
+    except Exception as e:
+        errs.append(f"bing: {type(e).__name__}: {e}")
+    return ("ERROR: all search engines failed:\n" + "\n".join("  " + e for e in errs)
+            + "\nTell the user search failed and show these reasons; do not invent results.")
 
 def t_browse(a):
-    req = urllib.request.Request(a["url"], headers=UA)
-    page = urllib.request.urlopen(req, timeout=12).read().decode("utf-8", "replace")
+    page = _fetch(a["url"], timeout=12)
     page = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", page)
     text = _strip_tags(page)
     return text[:6000] + ("…[truncated]" if len(text) > 6000 else "")
@@ -225,7 +245,6 @@ def run_agent(cfg, history, emit):
 
         for tok in llm_stream(cfg, messages):
             full += tok
-            # candidate hold positions for anything that may be a tool call
             cands = []
             jt = full.find('"tool"')
             if jt != -1:
@@ -239,7 +258,6 @@ def run_agent(cfg, history, emit):
             if limit > emitted:
                 emit({"type": "token", "text": full[emitted:limit]}); emitted = limit
 
-            # live "generating" card + progress counter
             if cands and gen_id is None:
                 gen_id, gen_from, gen_mark = uuid.uuid4().hex[:8], min(cands), len(full)
             if gen_id:
@@ -259,7 +277,6 @@ def run_agent(cfg, history, emit):
                     gen_mark = len(full)
                     emit({"type": "tool_progress", "id": gen_id, "size": len(full) - gen_from})
 
-            # complete call?
             wm = WRITE_RE.search(full)
             if wm:
                 e = full.find("<<end>>", wm.end())
@@ -270,14 +287,13 @@ def run_agent(cfg, history, emit):
                 if obj:
                     call = ("json", obj, s); break
 
-        # stream ended with an unterminated write block: accept the rest as content
         if call is None:
             wm = WRITE_RE.search(full)
             if wm and len(full) > wm.end():
                 call = ("write", wm, full[wm.end():].rstrip("\n"))
 
         if call is None:
-            if '"tool"' in full or "<<tool" in full or "<<write:" in full:   # malformed
+            if '"tool"' in full or "<<tool" in full or "<<write:" in full:
                 if gen_id:
                     emit({"type": "tool_end", "id": gen_id, "ok": False, "output": "malformed tool call"})
                 bad += 1
@@ -287,11 +303,10 @@ def run_agent(cfg, history, emit):
                 messages += [{"role": "assistant", "content": full},
                              {"role": "user", "content": 'Your tool call was malformed. Use the <<write:path>> block for files, or ONLY valid JSON like {"tool":"shell","args":{"command":"ls"}}.'}]
                 continue
-            if len(full) > emitted:                                          # plain answer
+            if len(full) > emitted:
                 emit({"type": "token", "text": full[emitted:]})
             emit({"type": "done"}); return
 
-        # resolve the call
         if call[0] == "write":
             name, args, s = "write_file", {"path": call[1].group(1).strip(), "content": call[2]}, call[1].start()
         else:
