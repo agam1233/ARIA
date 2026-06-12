@@ -13,23 +13,29 @@ ROOT = os.path.realpath(os.getcwd())
 PENDING = {}
 MAX_TURNS = 10
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
-VERSION = 0.25
-print(f"ARIA VERSION: {VERSION}")
 
 TOOL_SPEC = f"""
-You have REAL tools. To use one, reply with ONLY a JSON object (no prose, no backticks):
+You have REAL tools.
+
+To CREATE or OVERWRITE a file, use this exact block (RAW content — no JSON, no escaping, no backticks):
+<<write:relative/path.ext>>
+...full file content here...
+<<end>>
+
+For every OTHER tool, reply with ONLY a JSON object (no prose, no backticks), then STOP:
 {{"tool":"shell","args":{{"command":"uname -a"}}}}
-Then STOP. The result arrives as the next user message; continue from there (you may chain calls).
+The result arrives as the next user message; continue from there (you may chain calls).
 Tools:
 - read_file   args: {{"path":"relative/path"}}
-- write_file  args: {{"path":"relative/path","content":"..."}}
 - edit_file   args: {{"path":"relative/path","old_str":"...","new_str":"..."}} (old_str must be unique)
 - shell       args: {{"command":"..."}} (workspace cwd, 60s timeout)
 - search      args: {{"query":"..."}}
 - browse      args: {{"url":"https://..."}}
 Workspace: {ROOT}
-NEVER describe a command in prose instead of calling it. NEVER invent tool results.
-When done with tools, write a normal final answer containing no tool JSON.
+RULES:
+- NEVER put file content inside JSON — always use the <<write:...>> block for files.
+- NEVER describe a command in prose instead of calling it. NEVER invent tool results.
+- One tool call per reply. When done with tools, write a normal final answer (no JSON, no blocks).
 """.strip()
 
 # ── tools ──────────────────────────────────────────────────────────
@@ -82,7 +88,6 @@ def _ddg_url(href):
 
 def t_search(a):
     query, errs = a["query"], []
-    # 1) DDG Lite (POST) — most reliable for scraping
     try:
         data = urllib.parse.urlencode({"q": query}).encode()
         req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data,
@@ -104,7 +109,6 @@ def t_search(a):
         errs.append("lite: 0 results")
     except Exception as e:
         errs.append(f"lite: {e}")
-    # 2) DDG HTML (GET)
     try:
         req = urllib.request.Request(
             "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query), headers=UA)
@@ -141,9 +145,18 @@ def tool_detail(n, a):
             "edit_file": a.get("path", ""), "shell": "$ " + a.get("command", ""),
             "search": '"%s"' % a.get("query", ""), "browse": a.get("url", "")}.get(n, "")
 
-# ── forgiving tool-call extraction ─────────────────────────────────
+def partial_detail(name, text):
+    pats = {"read_file": r'"path"\s*:\s*"([^"]*)', "edit_file": r'"path"\s*:\s*"([^"]*)',
+            "shell": r'"command"\s*:\s*"([^"]*)', "search": r'"query"\s*:\s*"([^"]*)',
+            "browse": r'"url"\s*:\s*"([^"]*)'}
+    m = re.search(pats.get(name, r"$^"), text)
+    d = m.group(1) if m else ""
+    return ("$ " + d) if name == "shell" else d
+
+# ── tool-call extraction ───────────────────────────────────────────
+WRITE_RE = re.compile(r"<<write:([^\n>]+)>>\r?\n?")
+
 def extract_tool(text):
-    """Find first complete JSON object containing a "tool" key. Returns (obj, start, end) or (None,-1,-1)."""
     if '"tool"' not in text:
         return None, -1, -1
     for m in re.finditer(r"\{", text):
@@ -197,10 +210,10 @@ def llm_stream(cfg, messages):
             if tok: yield tok
 
 # ── agent loop ─────────────────────────────────────────────────────
-TRAIL = re.compile(r"(```json|```|<<tool>>|\s)+$")
+TRAIL = re.compile(r"(```json|```html|```|<<tool>>|\s)+$")
 
 def run_agent(cfg, history, emit):
-    sysp = cfg.get("sysPrompt", "You are Aria (Autonomous Reasoning Intelligent Agent), a local AI agent.")
+    sysp = cfg.get("sysPrompt", "Your Aria (Autonomous Reasoning Intelligent Agent), a local AI agent.")
     if cfg.get("deepResearch"):
         sysp += " Deep-research mode: plan multi-step search/browse investigations, verify claims, give a structured report."
     messages = [{"role": "system", "content": sysp + "\n\n" + TOOL_SPEC}] + history
@@ -208,44 +221,91 @@ def run_agent(cfg, history, emit):
 
     for _ in range(MAX_TURNS):
         full, emitted, call = "", 0, None
+        gen_id, gen_name, gen_from, gen_mark = None, None, 0, 0
+
         for tok in llm_stream(cfg, messages):
             full += tok
-            # hold back anything that might be the start of tool JSON
-            idxs = [i for i in (full.find('"tool"'), full.find("<<tool")) if i != -1]
-            if idxs:
-                idx = min(idxs)
-                brace = full.rfind("{", 0, idx)
-                limit = brace if brace != -1 else idx
-            else:
-                limit = len(full) - 12
+            # candidate hold positions for anything that may be a tool call
+            cands = []
+            jt = full.find('"tool"')
+            if jt != -1:
+                b = full.rfind("{", 0, jt)
+                cands.append(b if b != -1 else jt)
+            mt = full.find("<<tool")
+            if mt != -1: cands.append(mt)
+            wt = full.find("<<write:")
+            if wt != -1: cands.append(wt)
+            limit = min(cands) if cands else len(full) - 12
             if limit > emitted:
                 emit({"type": "token", "text": full[emitted:limit]}); emitted = limit
-            obj, s, e = extract_tool(full)
-            if obj:
-                call = (obj, s); break
+
+            # live "generating" card + progress counter
+            if cands and gen_id is None:
+                gen_id, gen_from, gen_mark = uuid.uuid4().hex[:8], min(cands), len(full)
+            if gen_id:
+                if gen_name is None:
+                    wm = WRITE_RE.search(full)
+                    if wt != -1 and wm and wm.start() == wt:
+                        gen_name = "write_file"
+                        emit({"type": "tool", "id": gen_id, "tool": "write_file",
+                              "detail": wm.group(1).strip(), "status": "gen"})
+                    else:
+                        nm = re.search(r'"tool"\s*:\s*"(\w+)"', full)
+                        if nm:
+                            gen_name = nm.group(1)
+                            emit({"type": "tool", "id": gen_id, "tool": gen_name,
+                                  "detail": partial_detail(gen_name, full), "status": "gen"})
+                elif len(full) - gen_mark > 350:
+                    gen_mark = len(full)
+                    emit({"type": "tool_progress", "id": gen_id, "size": len(full) - gen_from})
+
+            # complete call?
+            wm = WRITE_RE.search(full)
+            if wm:
+                e = full.find("<<end>>", wm.end())
+                if e != -1:
+                    call = ("write", wm, full[wm.end():e].rstrip("\n")); break
+            if '"tool"' in full:
+                obj, s, _ = extract_tool(full)
+                if obj:
+                    call = ("json", obj, s); break
+
+        # stream ended with an unterminated write block: accept the rest as content
+        if call is None:
+            wm = WRITE_RE.search(full)
+            if wm and len(full) > wm.end():
+                call = ("write", wm, full[wm.end():].rstrip("\n"))
 
         if call is None:
-            if '"tool"' in full or "<<tool" in full:        # malformed attempt
+            if '"tool"' in full or "<<tool" in full or "<<write:" in full:   # malformed
+                if gen_id:
+                    emit({"type": "tool_end", "id": gen_id, "ok": False, "output": "malformed tool call"})
                 bad += 1
                 if bad > 2:
                     emit({"type": "token", "text": "\n\n⚠️ The model kept producing malformed tool calls. Try a larger / more instruction-tuned model."})
                     emit({"type": "done"}); return
                 messages += [{"role": "assistant", "content": full},
-                             {"role": "user", "content": 'Your tool call was malformed. Reply with ONLY valid JSON like {"tool":"shell","args":{"command":"ls"}} and nothing else.'}]
+                             {"role": "user", "content": 'Your tool call was malformed. Use the <<write:path>> block for files, or ONLY valid JSON like {"tool":"shell","args":{"command":"ls"}}.'}]
                 continue
-            if len(full) > emitted:                          # plain answer
+            if len(full) > emitted:                                          # plain answer
                 emit({"type": "token", "text": full[emitted:]})
             emit({"type": "done"}); return
 
-        obj, s = call
+        # resolve the call
+        if call[0] == "write":
+            name, args, s = "write_file", {"path": call[1].group(1).strip(), "content": call[2]}, call[1].start()
+        else:
+            _, obj, s = call
+            name, args = obj.get("tool"), obj.get("args", {}) or {}
         pre = TRAIL.sub("", full[:s])
         if len(pre) > emitted:
             emit({"type": "token", "text": pre[emitted:]})
-        name, args = obj.get("tool"), obj.get("args", {}) or {}
-        cid, detail = uuid.uuid4().hex[:8], tool_detail(name, args)
+        cid = gen_id or uuid.uuid4().hex[:8]
+        detail = tool_detail(name, args)
 
         if name not in TOOLS:
             result = f"ERROR: unknown tool '{name}'. Valid: {', '.join(TOOLS)}"
+            emit({"type": "tool", "id": cid, "tool": name or "?", "detail": detail, "status": "run"})
         else:
             flag = CONFIRM.get(name)
             if flag and cfg.get(flag, True):
@@ -270,7 +330,7 @@ def run_agent(cfg, history, emit):
         emit({"type": "tool_end", "id": cid, "ok": not str(result).startswith("ERROR"),
               "output": str(result)[:2500]})
         messages += [{"role": "assistant", "content": full},
-                     {"role": "user", "content": f"Tool result for {name}:\n{result}\n\nContinue: call another tool if needed, otherwise give the final answer in plain language (no JSON)."}]
+                     {"role": "user", "content": f"Tool result for {name}:\n{result}\n\nContinue: call another tool if needed, otherwise give the final answer in plain language (no JSON, no blocks)."}]
 
     emit({"type": "token", "text": "\n\n⚠️ Reached the tool-call limit for one message."})
     emit({"type": "done"})
@@ -519,7 +579,7 @@ box-shadow:var(--sh);padding:22px 24px;overflow-y:auto;transform:translateX(100%
     <button class="sg" data-p="What OS and hardware am I running on?">🖥️ System info</button>
     <button class="sg" data-p="List the files here and summarize this project.">📖 Explore folder</button>
     <button class="sg" data-p="Search the web for the latest stable Python version.">🔎 Web search</button>
-    <button class="sg" data-p="Run git status and summarize the repo state.">🌿 Git status</button></div></div>
+    <button class="sg" data-p="Create a simple landing page in landing/index.html for a chatbot product.">✏️ Build a page</button></div></div>
   <div id="scroll"><div id="thread"></div></div>
   <div id="dock"><div class="comp">
     <textarea id="input" rows="1" placeholder="Message Aria…"></textarea>
@@ -682,8 +742,11 @@ async function send(){
      if(!am.text)ce.innerHTML='';
      let cd=cards[ev.id];
      if(!cd){cd=document.createElement('div');cd.className='tc'+(cfg.expandTools?' open':'');cards[ev.id]=cd;te.appendChild(cd)}
+     cd.dataset.det=ev.detail||'';
      const h=`<span>${IC[ev.tool]||'🔧'}</span><b>${ev.tool}</b><span class="det">${esc(ev.detail||'')}</span>`;
-     if(ev.status==='confirm'){
+     if(ev.status==='gen')
+      cd.innerHTML=`<div class="th">${h}<span style="margin-left:auto;font-size:11px;color:var(--dim)">generating</span><div class="sp" style="margin-left:8px"></div></div>`;
+     else if(ev.status==='confirm'){
       cd.innerHTML=`<div class="th">${h}<div class="tconf"><button class="n" data-a="0">Deny</button><button class="y" data-a="1">Approve</button></div></div>`;
       cd.querySelector('.tconf').onclick=async e2=>{const b=e2.target.closest('button');if(!b)return;
        cd.querySelector('.tconf').outerHTML=b.dataset.a==='1'?'<div class="sp"></div>':'<span class="ok2 bad">denied</span>';
@@ -691,6 +754,9 @@ async function send(){
         body:JSON.stringify({id:ev.id,approved:b.dataset.a==='1'})})}}
      else cd.innerHTML=`<div class="th">${h}<div class="sp"></div></div>`;
      sd(true)}
+    else if(ev.type==='tool_progress'){const cd=cards[ev.id];if(!cd)continue;
+     const d=cd.querySelector('.det');
+     if(d)d.textContent=(cd.dataset.det||'')+' · '+(ev.size/1024).toFixed(1)+' KB';sd(true)}
     else if(ev.type==='tool_end'){const cd=cards[ev.id];if(!cd)continue;
      const h=cd.querySelector('.th');h.querySelector('.sp')?.remove();h.querySelector('.tconf')?.remove();
      if(!h.querySelector('.ok2'))h.insertAdjacentHTML('beforeend',`<span class="ok2 ${ev.ok?'':'bad'}">${ev.ok?'✓':'✕'}</span>`);
