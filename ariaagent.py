@@ -1,950 +1,744 @@
-import requests
-import json
-import sys
-import subprocess
-import re
-import os
-import time
-import datetime
-import shutil
-import threading
-import tempfile
-import io
-import difflib
-from pathlib import Path
-
-# Wrap readline to prevent crashes on systems (like Windows) without it
-try:
-    import readline
-except ImportError:
-    readline = None
-
-# ══════════════════════════════════════════════════════════════════════
-#  VERSION & CONSTANTS
-# ══════════════════════════════════════════════════════════════════════
-
-VERSION       = " X 0.1"
-NEWVERSION = "This is a secret message! Soon a new version called 0.25 will be released, with major changes. This will be drastic as the last time we've had a major update was 1-2 days ago.)
-DEFAULT_MODEL = "qwen3.5:9b"
-OLLAMA_BASE   = "http://localhost:11434"
-CHAT_URL      = f"{OLLAMA_BASE}/api/chat"
-SESSION_DIR   = Path.home() / ".aria_sessions"
-CONFIG_FILE   = Path.home() / ".aria_config.json"
-MODEL_MEMORY_FILE = Path.home() / ".aria_model_config.json"
-BACKUP_DIR    = Path.home() / ".aria_backups"
-HISTORY_FILE  = Path.home() / ".aria_history"
-MAX_TOOL_LOOPS = 10
-MAX_OUTPUT_LEN = 8000
-
-SESSION_DIR.mkdir(parents=True, exist_ok=True)
-BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-
-# ══════════════════════════════════════════════════════════════════════
-#  COLORS
-# ══════════════════════════════════════════════════════════════════════
-
-class C:
-    R = "\033[0m"; B = "\033[1m"; DIM = "\033[2m"; ITALIC = "\033[3m"
-    GRAY = "\033[90m"; RED = "\033[91m"; GREEN = "\033[92m"
-    YELLOW = "\033[93m"; BLUE = "\033[94m"; MAGENTA = "\033[95m"
-    CYAN = "\033[96m"; WHITE = "\033[97m"; DGREEN = "\033[32m"
-    BG_RED = "\033[41m"; BG_YELLOW = "\033[43m"; BG_GREEN = "\033[42m"
-    BG_BLUE = "\033[44m"; BG_CYAN = "\033[46m"
-
-def c(color, text): return f"{color}{text}{C.R}"
-
-# ══════════════════════════════════════════════════════════════════════
-#  UTILITIES
-# ══════════════════════════════════════════════════════════════════════
-
-_start_time = time.time()
-_msg_count  = 0
-
-def get_terminal_width():
-    try:    return os.get_terminal_size().columns
-    except: return 80
-
-def rule(char="─", color=C.GRAY):
-    w = min(get_terminal_width() - 4, 72)
-    print(f"  {c(color, char * w)}")
-
-def detect_workspace():
-    cwd = Path.cwd()
-    info = []
-    try:
-        root   = subprocess.check_output(['git','rev-parse','--show-toplevel'], stderr=subprocess.DEVNULL, text=True).strip()
-        branch = subprocess.check_output(['git','branch','--show-current'],     stderr=subprocess.DEVNULL, text=True).strip()
-        info.append(f"git:{Path(root).name}@{branch}")
-    except: pass
-    if os.environ.get('VIRTUAL_ENV'):
-        info.append(f"venv:{Path(os.environ['VIRTUAL_ENV']).name}")
-    return ' · '.join(info) if info else None
-
-def truncate_output(text, max_len=MAX_OUTPUT_LEN):
-    if len(text) <= max_len: return text
-    omitted = len(text) - max_len
-    return text[:max_len] + f"\n{c(C.YELLOW,'…')} {c(C.GRAY, f'{omitted:,} chars omitted')}"
-
-def uptime_str():
-    s = int(time.time() - _start_time)
-    if s < 60:   return f"{s}s"
-    if s < 3600: return f"{s//60}m {s%60}s"
-    return f"{s//3600}h {(s%3600)//60}m"
-
-def suggest_command(bad_cmd, known_cmds):
-    matches = difflib.get_close_matches(bad_cmd, known_cmds, n=1, cutoff=0.6)
-    return matches[0] if matches else None
-
-# ══════════════════════════════════════════════════════════════════════
-#  READLINE HISTORY
-# ══════════════════════════════════════════════════════════════════════
-
-def setup_readline():
-    if readline is None:
-        return
-    try:
-        if HISTORY_FILE.exists():
-            readline.read_history_file(str(HISTORY_FILE))
-        readline.set_history_length(500)
-        readline.parse_and_bind("tab: complete")
-    except Exception:
-        pass
-
-def save_readline_history():
-    if readline is None:
-        return
-    try:
-        readline.write_history_file(str(HISTORY_FILE))
-    except Exception:
-        pass
-
-# ══════════════════════════════════════════════════════════════════════
-#  DANGEROUS COMMAND DETECTION
-# ══════════════════════════════════════════════════════════════════════
-
-DANGEROUS_PATTERNS = [
-    r'rm\s+(-rf?|--recursive)?\s*/', r'sudo\s+', r'dd\s+', r'mkfs',
-    r'>\s*/dev/sd[a-z]', r':\(\)\s*{\s*:;\s*};:', r'chmod\s+777\s+/',
-    r'curl.*\|\s*sh', r'wget.*\|\s*sh', r'killall', r'pkill', r'kill\s+-9',
-    r'nc\s+-l', r'nc\s+-e', r'python\s+-c\s+[\'"]import\s+os'
-]
-
-def is_dangerous_command(cmd):
-    return any(re.search(p, cmd.lower()) for p in DANGEROUS_PATTERNS)
-
-def danger_confirm(action_desc, details=""):
-    print()
-    rule("─", C.RED)
-    print(f"  {c(C.RED+C.B, '⚠  DANGEROUS ACTION')}  {c(C.GRAY, action_desc)}")
-    if details:
-        print(f"  {c(C.GRAY, details[:200])}")
-    rule("─", C.RED)
-    ans = input(f"  {c(C.RED+C.B, 'Type YES to allow:')} ").strip()
-    return ans == "YES"
-
-# ══════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════
-
-DEFAULT_CFG = {
-    "model": DEFAULT_MODEL, "temperature": 0.4, "top_p": 0.95,
-    "ctx": 64000, "max_tokens": -1, "stream": True, "search_n": 5,
-    "allow_shell": False, "allow_network": True, "allow_write": True,
-    "danger_confirm": True,
-}
-cfg = dict(DEFAULT_CFG)
-#no, github copilot i didnt remove a comment
-def load_config():
-    global cfg
-    if CONFIG_FILE.exists():
-        try: cfg.update(json.loads(CONFIG_FILE.read_text(encoding='utf-8')))
-        except: pass
-    for k, v in DEFAULT_CFG.items():
-        if k not in cfg: cfg[k] = v
-
-def save_config():
-    try: CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
-    except: pass
-
-DEFAULT_MEMORY = {
-    "browser_cmd": "firefox", "editor_cmd": "code",
-    "default_project": str(Path.home() / "projects"), "shell_enabled": False
-}
-model_memory = dict(DEFAULT_MEMORY)
-
-def load_model_memory():
-    global model_memory
-    if MODEL_MEMORY_FILE.exists():
-        try: model_memory.update(json.loads(MODEL_MEMORY_FILE.read_text(encoding='utf-8')))
-        except: pass
-    for k, v in DEFAULT_MEMORY.items():
-        if k not in model_memory: model_memory[k] = v
-
-def save_model_memory():
-    try: MODEL_MEMORY_FILE.write_text(json.dumps(model_memory, indent=2), encoding='utf-8')
-    except: pass
-
-def first_time_setup():
-    print(f"\n  {c(C.CYAN+C.B, '✨ First-time setup')}")
-    rule()
-    browser = input(f"  {c(C.YELLOW, 'Default browser')}  {c(C.GRAY,'[firefox]:')} ").strip()
-    model_memory["browser_cmd"] = browser or "firefox"
-    editor  = input(f"  {c(C.YELLOW, 'Default editor')}   {c(C.GRAY,'[code]:')} ").strip()
-    model_memory["editor_cmd"]  = editor or "code"
-    default_proj = DEFAULT_MEMORY["default_project"]
-    proj    = input(f"  {c(C.YELLOW, 'Projects folder')} {c(C.GRAY, '[' + default_proj + ']:')} ").strip()
-    model_memory["default_project"] = proj or DEFAULT_MEMORY["default_project"]
-    Path(model_memory["default_project"]).mkdir(parents=True, exist_ok=True)
-    enable = input(f"  {c(C.YELLOW, 'Enable shell?')}    {c(C.GRAY,'(yes/no) [yes]:')} ").strip().lower()
-    model_memory["shell_enabled"] = enable in ('yes', 'y', 'true', '')
-    save_model_memory()
-    cfg["allow_shell"] = model_memory["shell_enabled"]
-    save_config()
-    rule()
-    ok(f"Saved. Shell: {'ON' if cfg['allow_shell'] else 'OFF'}")
-    time.sleep(0.8)
-
-# ══════════════════════════════════════════════════════════════════════
-#  SYSTEM PROMPT
-# ══════════════════════════════════════════════════════════════════════
-
-def system_prompt():
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    cwd = os.getcwd()
-    ws  = detect_workspace()
-    shell_status = "ENABLED (dangerous blocked)" if cfg["allow_shell"] else "DISABLED"
-    return f"""Your ARIA, an Autonomous Reasoning Intelligent Agent. Be direct and efficient.
-
-[ENVIRONMENT]
-Time: {now} | CWD: {cwd} | Workspace: {ws or 'none'}
-Security: Shell={shell_status} | Network={cfg["allow_network"]}
-
-[USER PREFERENCES]
-- Browser: `{model_memory["browser_cmd"]}` (use this to open URLs)
-- Editor: `{model_memory["editor_cmd"]}`
-- Projects: `{model_memory["default_project"]}`
-
-[TOOLS] – Use ONE tag at a time, wait for result.
-<search>query</search>
-<read>file</read>
-<write file="path">content</write>
-<summarize>file</summarize>
-<http url="URL"/>
-<execute>command</execute>
-<pyeval>python code</pyeval>
-<listdir>path</listdir>
-<glob>pattern</glob>
-<grep>pattern file</grep>
-<edit file="path" pattern="regex">replacement</edit>
-<move src="from" dest="to"/>
-<copy src="from" dest="to"/>
-<cd>path</cd>
-
-Example: <execute>{model_memory["browser_cmd"]} https://youtube.com</execute>
-Do not nest tags. Close all tags properly.
-ALWAYS code the best html possible.
+#!/usr/bin/env python3
 """
+Aria — Autonomous Reasoning Intelligent Agent. Standalone local AI agent with a web UI.
+Run:  python aria.py        (stdlib only, no installs)
+Opens http://127.0.0.1:8400 — tools operate in the launch directory.
+"""
+import json, os, re, subprocess, threading, uuid, html as htmlmod
+import urllib.request, urllib.parse, webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ══════════════════════════════════════════════════════════════════════
-#  SPINNER
-# ══════════════════════════════════════════════════════════════════════
+PORT = 8400
+ROOT = os.path.realpath(os.getcwd())
+PENDING = {}
+MAX_TURNS = 10
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+VERSION = 0.25
+print(f"ARIA VERSION: {VERSION}")
 
-SPINNER_MSGS = {
-    "thinking":   ["thinking…", "reasoning…", "processing…", "computing…"],
-    "searching":  ["searching the web…", "fetching results…", "looking it up…"],
-    "running":    ["running command…", "executing…", "spawning process…"],
-    "reading":    ["reading file…", "loading…", "parsing…"],
-    "fetching":   ["fetching URL…", "downloading…", "requesting…"],
-}
+TOOL_SPEC = f"""
+You have REAL tools. To use one, reply with ONLY a JSON object (no prose, no backticks):
+{{"tool":"shell","args":{{"command":"uname -a"}}}}
+Then STOP. The result arrives as the next user message; continue from there (you may chain calls).
+Tools:
+- read_file   args: {{"path":"relative/path"}}
+- write_file  args: {{"path":"relative/path","content":"..."}}
+- edit_file   args: {{"path":"relative/path","old_str":"...","new_str":"..."}} (old_str must be unique)
+- shell       args: {{"command":"..."}} (workspace cwd, 60s timeout)
+- search      args: {{"query":"..."}}
+- browse      args: {{"url":"https://..."}}
+Workspace: {ROOT}
+NEVER describe a command in prose instead of calling it. NEVER invent tool results.
+When done with tools, write a normal final answer containing no tool JSON.
+""".strip()
 
-class Spinner:
-    FRAMES = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
-    def __init__(self, kind="thinking"):
-        msgs = SPINNER_MSGS.get(kind, SPINNER_MSGS["thinking"])
-        self.msgs  = msgs
-        self._stop = threading.Event()
-        self._t    = threading.Thread(target=self._spin, daemon=True)
-    def _spin(self):
-        i = 0
-        while not self._stop.is_set():
-            msg = self.msgs[i // 12 % len(self.msgs)]
-            sys.stdout.write(f"\r  {c(C.CYAN, self.FRAMES[i % 10])} {c(C.GRAY, msg)}   ")
-            sys.stdout.flush()
-            time.sleep(0.08)
-            i += 1
-    def start(self):  self._t.start(); return self
-    def stop(self):
-        self._stop.set(); self._t.join(timeout=0.5)
-        sys.stdout.write(f"\r{' ' * 60}\r"); sys.stdout.flush()
+# ── tools ──────────────────────────────────────────────────────────
+def safe_path(p):
+    full = os.path.realpath(os.path.join(ROOT, p))
+    if full != ROOT and not full.startswith(ROOT + os.sep):
+        raise ValueError("path escapes workspace")
+    return full
 
-# ══════════════════════════════════════════════════════════════════════
-#  STATUS HELPERS
-# ══════════════════════════════════════════════════════════════════════
+def t_read_file(a):
+    with open(safe_path(a["path"]), encoding="utf-8", errors="replace") as f:
+        d = f.read()
+    return d[:12000] + ("\n…[truncated]" if len(d) > 12000 else "")
 
-def ok(m):   print(f"  {c(C.GREEN,  '✓')}  {m}")
-def warn(m): print(f"  {c(C.YELLOW, '⚠')}  {m}")
-def err(m):  print(f"  {c(C.RED,    '✗')}  {m}")
-def info(m): print(f"  {c(C.BLUE,   '·')}  {c(C.GRAY, m)}")
+def t_write_file(a):
+    fp = safe_path(a["path"])
+    os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(a["content"])
+    return f"Wrote {len(a['content'])} bytes to {a['path']}"
 
-def tool_header(icon, tag, detail=""):
-    trunc = detail[:70] + ("…" if len(detail) > 70 else "")
-    print(f"\n  {c(C.MAGENTA, icon)} {c(C.GRAY+C.DIM, tag+':')} {c(C.WHITE, trunc)}")
-#note from the dev, what you doing here?
-def tool_result_box(result, success=True):
-    color  = C.DGREEN if success else C.RED
-    lines  = result.splitlines()
-    prefix = f"  {c(color, '│')} "
-    for ln in lines[:30]:
-        print(f"{prefix}{c(C.GRAY, ln)}")
-    if len(lines) > 30:
-        print(f"{prefix}{c(C.GRAY+C.DIM, f'  … {len(lines)-30} more lines')}")
+def t_edit_file(a):
+    fp = safe_path(a["path"])
+    with open(fp, encoding="utf-8") as f:
+        d = f.read()
+    n = d.count(a["old_str"])
+    if n != 1:
+        return f"ERROR: old_str found {n} times (need exactly 1)"
+    with open(fp, "w", encoding="utf-8") as f:
+        f.write(d.replace(a["old_str"], a["new_str"], 1))
+    return f"Edited {a['path']}"
 
-# ══════════════════════════════════════════════════════════════════════
-#  BANNER & PROMPT
-# ══════════════════════════════════════════════════════════════════════
-
-def check_ollama():
+def t_shell(a):
     try:
-        r = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=3)
-        models = [m["name"] for m in r.json().get("models", [])]
-        if cfg["model"] in models or any(cfg["model"].split(":")[0] in m for m in models):
-            return True, models
-        return False, models
-    except:
-        return None, []
-
-def banner():
-    w = min(get_terminal_width(), 76)
-    print()
-    print(f"  {c(C.CYAN+C.B, 'ARIA')} {c(C.GRAY, 'v'+VERSION)}  {c(C.DIM+C.GRAY, '·  Autonomous Reasoning Agent')}")
-    rule()
-
-    online, models = check_ollama()
-    if online is None:
-        model_status = c(C.RED, '✗ ollama offline')
-    elif not online:
-        model_status = c(C.YELLOW, f'⚠ model not found  (available: {", ".join(models[:3])})')
-    else:
-        model_status = c(C.GREEN, '✓ ready')
-
-    shell_col = C.GREEN if cfg['allow_shell']   else C.GRAY
-    net_col   = C.GREEN if cfg['allow_network'] else C.GRAY
-    write_col = C.GREEN if cfg['allow_write']   else C.GRAY
-
-    print(f"  {c(C.GRAY,'model')}   {c(C.WHITE, cfg['model'])}  {model_status}")
-    ctx_str = f"{cfg['ctx']:,}"
-    print(f"  {c(C.GRAY,'ctx')}     {c(C.WHITE, ctx_str)}  {c(C.GRAY,'·')}  {c(C.GRAY,'temp')} {c(C.WHITE, cfg['temperature'])}")
-    print(f"  {c(C.GRAY,'access')}  shell {c(shell_col, '●')}  network {c(net_col, '●')}  write {c(write_col, '●')}")
-    rule()
-    info("type /help for commands, ↑↓ for history")
-    print()
-
-def prompt_line():
-    global _msg_count
-    ws     = detect_workspace()
-    ws_str = f" {c(C.DGREEN, ws)}" if ws else ""
-    cwd    = c(C.GRAY+C.DIM, Path.cwd().name)
-    count  = c(C.GRAY+C.DIM, f"#{_msg_count+1}")
-    return f"\n  {count} {cwd}{ws_str}\n  {c(C.GREEN+C.B,'▶')} {c(C.WHITE+C.B,'you')}: "
-
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL IMPLEMENTATIONS
-# ══════════════════════════════════════════════════════════════════════
-
-def change_directory(path):
-    p = Path(path).expanduser().resolve()
-    if not p.exists():  return f"Error: {path} does not exist", False
-    if not p.is_dir():  return f"Error: {path} not a directory", False
-    try:
-        os.chdir(p)
-        return f"Changed directory to {p}", True
-    except Exception as e:
-        return f"cd failed: {e}", False
-
-def search_web(query):
-    if not cfg["allow_network"]: return "Network disabled", False
-    try:
-        import urllib.parse
-        import html
-        
-        # Use html.duckduckgo for more predictable DOM and spoof a standard browser
-        url = "https://html.duckduckgo.com/html/"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-        
-        resp = requests.post(url, data={"q": query}, timeout=15, headers=headers)
-        resp.raise_for_status()
-
-        results = []
-        # Use finditer to search across the entire HTML string, ignoring line breaks
-        pattern = r'<a class="result__url" href="([^"]+)".*?>(.*?)</a>'
-        
-        for match in re.finditer(pattern, resp.text, re.IGNORECASE | re.DOTALL):
-            link = match.group(1)
-            title = re.sub(r'<[^>]+>', '', match.group(2)).strip()
-            title = html.unescape(title)
-
-            # DuckDuckGo wraps links in a redirect tracker; extract the real URL
-            if 'uddg=' in link:
-                qs = urllib.parse.parse_qs(urllib.parse.urlparse("http:" + link).query)
-                link = qs.get('uddg', [link])[0]
-
-            results.append(f"{title}\n  {link}")
-            if len(results) >= cfg.get("search_n", 5): break
-            
-        out = "\n\n".join(results) if results else "No results. (HTML structure may have changed or the request was blocked)."
-        return out, bool(results)
-        
-    except Exception as e:
-        return f"Search error: {e}", False
-
-def http_fetch(url):
-    if not cfg["allow_network"]: return "Network disabled", False
-    try:
-        resp = requests.get(url, timeout=15, headers={"User-Agent": "ARIA/6.0"})
-        resp.raise_for_status()
-        if 'application/json' in resp.headers.get('content-type', ''):
-            try:
-                out = json.dumps(resp.json(), indent=2)[:MAX_OUTPUT_LEN]
-            except ValueError:
-                out = truncate_output(resp.text)
-        else:
-            out = truncate_output(resp.text)
-        return out, True
-    except Exception as e:
-        return f"HTTP error: {e}", False
-
-def summarize_file(filepath):
-    p = Path(filepath).expanduser()
-    if not p.exists(): return f"Error: {filepath} not found", False
-    if p.is_dir():     return f"Error: {filepath} is a directory", False
-    stat = p.stat()
-    try:
-        with p.open('r', encoding='utf-8', errors='replace') as f:
-            lines = sum(1 for _ in f)
-            f.seek(0)
-            words = sum(len(l.split()) for l in f)
-    except:
-        lines = words = -1
-    preview = ""
-    if 0 < stat.st_size < 50000:
-        preview = "\n\nFirst 20 lines:\n" + "\n".join(p.read_text(encoding='utf-8', errors='replace').splitlines()[:20])
-    out = f"File: {p.name}\nSize: {stat.st_size:,} bytes\nLines: {lines:,}\nWords: {words:,}{preview}"
-    return out, True
-
-def python_eval(code):
-    old_out, old_err = sys.stdout, sys.stderr
-    try:
-        sys.stdout = io.StringIO()
-        sys.stderr = io.StringIO()
-        exec(code, {"__name__": "__aria_exec__"})
-        out = sys.stdout.getvalue()
-        err_out = sys.stderr.getvalue()
-        result = truncate_output(out + (f"\n[stderr]:\n{err_out}" if err_out else "")) or "(no output)"
-        return result, True
-    except Exception as e:
-        return f"Python error: {e}", False
-    finally:
-        sys.stdout, sys.stderr = old_out, old_err
-
-def list_directory(path):
-    p = Path(path).expanduser().resolve()
-    if not p.exists(): return f"Error: {path} does not exist", False
-    if not p.is_dir(): return f"Error: {path} not a directory", False
-    try:
-        items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
-        lines = []
-        for i in items[:100]:
-            size = ""
-            if i.is_file():
-                s = i.stat().st_size
-                size = f"  {c(C.GRAY+C.DIM, f'{s:,}B')}" if s < 1024 else f"  {c(C.GRAY+C.DIM, f'{s//1024}KB')}"
-            icon = "📁" if i.is_dir() else "📄"
-            lines.append(f"{icon} {i.name}{size}")
-        if len(items) > 100:
-            lines.append(f"… and {len(items)-100} more")
-        return "\n".join(lines) if lines else "(empty)", True
-    except Exception as e:
-        return f"Listdir error: {e}", False
-
-def glob_files(pattern):
-    try:
-        matches = sorted(Path.cwd().glob(pattern))
-        out = "\n".join(str(p) for p in matches[:200]) or "No matches"
-        return out, bool(matches)
-    except Exception as e:
-        return f"Glob error: {e}", False
-
-def grep_file(pattern, filepath):
-    p = Path(filepath).expanduser()
-    if not p.exists(): return f"Error: {filepath} not found", False
-    try:
-        lines   = p.read_text(encoding='utf-8', errors='replace').splitlines()
-        results = []
-        for i, line in enumerate(lines, 1):
-            if re.search(pattern, line, re.IGNORECASE):
-                results.append(f"{c(C.GRAY+C.DIM, str(i).rjust(4))}  {line.strip()[:200]}")
-                if len(results) >= 50: break
-        out = "\n".join(results) if results else "No matches"
-        return out, bool(results)
-    except Exception as e:
-        return f"Grep error: {e}", False
-
-def edit_file(filepath, pattern, replacement):
-    p = Path(filepath).expanduser()
-    if not p.exists(): return f"Error: {filepath} not found", False
-    try:
-        original = p.read_text(encoding='utf-8')
-        new_content, count = re.subn(pattern, replacement, original)
-        if count == 0: return "No matches found", False
-        backup = BACKUP_DIR / f"{p.name}_{int(time.time())}.bak"
-        shutil.copy(p, backup)
-        p.write_text(new_content, encoding='utf-8')
-        return f"Replaced {count} occurrence(s) in {filepath}\nBackup: {backup.name}", True
-    except Exception as e:
-        return f"Edit failed: {e}", False
-
-def move_file(src, dst):
-    src_p, dst_p = Path(src).expanduser(), Path(dst).expanduser()
-    if not src_p.exists(): return f"Error: source {src} not found", False
-    try:
-        dst_p.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src_p), str(dst_p))
-        return f"Moved {src} → {dst}", True
-    except Exception as e:
-        return f"Move failed: {e}", False
-
-def copy_file(src, dst):
-    src_p, dst_p = Path(src).expanduser(), Path(dst).expanduser()
-    if not src_p.exists(): return f"Error: source {src} not found", False
-    try:
-        dst_p.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_p, dst_p)
-        return f"Copied {src} → {dst}", True
-    except Exception as e:
-        return f"Copy failed: {e}", False
-
-def run_shell_command(cmd):
-    if not cfg["allow_shell"]:
-        return "Shell disabled — enable with /allow shell true", False
-    if not cmd: return "Empty command", False
-    if is_dangerous_command(cmd):
-        if cfg["danger_confirm"] and not danger_confirm("Dangerous command", cmd):
-            return "User denied", False
-        else:
-            return "Command blocked for safety", False
-    spin = Spinner("running").start()
-    try:
-        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60, cwd=os.getcwd())
-        spin.stop()
-        out = res.stdout + res.stderr
-        ok_flag = res.returncode == 0
-        prefix = c(C.GREEN if ok_flag else C.RED, f"exit {res.returncode}")
-        return f"{prefix}\n{truncate_output(out.strip() or '(no output)')}", ok_flag
+        r = subprocess.run(a["command"], shell=True, cwd=ROOT, timeout=60,
+                           capture_output=True, text=True)
+        out = (r.stdout + (("\n" + r.stderr) if r.stderr else "")).strip() or "(no output)"
+        return f"exit {r.returncode}\n{out[:6000]}"
     except subprocess.TimeoutExpired:
-        spin.stop()
-        return "Command timed out after 60s", False
-    except Exception as e:
-        spin.stop()
-        return f"Execution failed: {e}", False
+        return "ERROR: timed out (60s)"
 
-def write_file(filepath, content):
-    if not cfg["allow_write"]: return "File write disabled", False
-    p = Path(filepath).expanduser()
+def _strip_tags(s):
+    return htmlmod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))).strip()
+
+def _ddg_url(href):
+    if href.startswith("//"):
+        href = "https:" + href
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg")
+    return urllib.parse.unquote(q[0]) if q else href
+
+def t_search(a):
+    query, errs = a["query"], []
+    # 1) DDG Lite (POST) — most reliable for scraping
     try:
-        if p.exists() and cfg["danger_confirm"]:
-            if not danger_confirm("Overwrite file", f"Overwrite {filepath}?"):
-                return "User denied overwrite", False
-            backup = BACKUP_DIR / f"{p.name}_{int(time.time())}.bak"
-            shutil.copy(p, backup)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding='utf-8')
-        return f"Wrote {len(content):,} chars to {filepath}", True
+        data = urllib.parse.urlencode({"q": query}).encode()
+        req = urllib.request.Request("https://lite.duckduckgo.com/lite/", data=data,
+                                     headers={**UA, "Content-Type": "application/x-www-form-urlencoded"})
+        page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+        hits = re.findall(r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', page, re.S) \
+            or re.findall(r'<a rel="nofollow" href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
+        out, seen = [], set()
+        for href, title in hits:
+            url = _ddg_url(href)
+            if not url.startswith("http") or url in seen:
+                continue
+            seen.add(url)
+            out.append(f"- {_strip_tags(title)}\n  {url}")
+            if len(out) >= 6:
+                break
+        if out:
+            return "\n".join(out)
+        errs.append("lite: 0 results")
     except Exception as e:
-        return f"Write failed: {e}", False
-
-def read_file(filepath):
-    p = Path(filepath).expanduser()
-    if not p.exists(): return f"Error: {filepath} not found", False
-    if p.is_dir():     return f"Error: {filepath} is a directory", False
+        errs.append(f"lite: {e}")
+    # 2) DDG HTML (GET)
     try:
-        content = p.read_text(encoding='utf-8', errors='replace')
-        return f"Contents of {filepath}:\n\n{truncate_output(content)}", True
+        req = urllib.request.Request(
+            "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query), headers=UA)
+        page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+        out, seen = [], set()
+        for m in re.finditer(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S):
+            url = _ddg_url(m.group(1))
+            if url in seen:
+                continue
+            seen.add(url)
+            out.append(f"- {_strip_tags(m.group(2))}\n  {url}")
+            if len(out) >= 6:
+                break
+        if out:
+            return "\n".join(out)
+        errs.append("html: 0 results")
     except Exception as e:
-        return f"Read error: {e}", False
+        errs.append(f"html: {e}")
+    return "ERROR: search unavailable (" + "; ".join(errs) + "). Tell the user search failed; do not invent results."
 
-# ══════════════════════════════════════════════════════════════════════
-#  TOOL PROCESSOR
-# ══════════════════════════════════════════════════════════════════════
+def t_browse(a):
+    req = urllib.request.Request(a["url"], headers=UA)
+    page = urllib.request.urlopen(req, timeout=12).read().decode("utf-8", "replace")
+    page = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", page)
+    text = _strip_tags(page)
+    return text[:6000] + ("…[truncated]" if len(text) > 6000 else "")
 
-def process_tools(text):
-    # cd
-    cd_m = re.search(r'<cd>(.*?)</cd>', text, re.IGNORECASE | re.DOTALL)
-    if cd_m:
-        path = cd_m.group(1).strip()
-        tool_header("📂", "cd", path)
-        result, ok_f = change_directory(path)
-        tool_result_box(result, ok_f)
-        return True, result
+TOOLS = {"read_file": t_read_file, "write_file": t_write_file, "edit_file": t_edit_file,
+         "shell": t_shell, "search": t_search, "browse": t_browse}
+CONFIRM = {"shell": "confirmShell", "write_file": "confirmWrite", "edit_file": "confirmWrite"}
 
-    # standard tools
-    tools = [
-        ('execute', run_shell_command,
-         r'<execute>(.*?)</execute>', lambda m: m.group(1).strip(), "⚡", "running"),
-        ('write', write_file,
-         r'<write\s+file=["\']([^"\']+)["\'][^>]*>(.*?)</write>',
-         lambda m: (m.group(1), m.group(2).strip()), "💾", "reading"),
-        ('read', read_file,
-         r'<read>(.*?)</read>', lambda m: m.group(1).strip(), "📖", "reading"),
-        ('summarize', summarize_file,
-         r'<summarize>(.*?)</summarize>', lambda m: m.group(1).strip(), "📋", "reading"),
-        ('search', search_web,
-         r'<search>(.*?)</search>', lambda m: m.group(1).strip(), "🔍", "searching"),
-        ('listdir', list_directory,
-         r'<listdir>(.*?)</listdir>', lambda m: m.group(1).strip(), "📁", "reading"),
-        ('glob', glob_files,
-         r'<glob>(.*?)</glob>', lambda m: m.group(1).strip(), "🔎", "reading"),
-        ('grep', grep_file,
-         r'<grep>(.*?)</grep>',
-         lambda m: m.group(1).strip().split(maxsplit=1), "🔬", "reading"),
-        ('pyeval', python_eval,
-         r'<pyeval>(.*?)</pyeval>', lambda m: m.group(1).strip(), "🐍", "thinking"),
-    ]
-    for tag, handler, pattern, extractor, icon, spin_kind in tools:
-        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
-        if match:
-            detail = (match.group(1) or "").strip()
-            tool_header(icon, tag, detail)
-            args   = extractor(match)
-            result, ok_f = handler(*args) if isinstance(args, tuple) else handler(args)
-            tool_result_box(result, ok_f)
-            return True, result
+def tool_detail(n, a):
+    return {"read_file": a.get("path", ""), "write_file": a.get("path", ""),
+            "edit_file": a.get("path", ""), "shell": "$ " + a.get("command", ""),
+            "search": '"%s"' % a.get("query", ""), "browse": a.get("url", "")}.get(n, "")
 
-    # HTTP
-    http_m = re.search(r'<http\s+url=["\']?([^"\'>\s]+)["\']?\s*/?>', text, re.IGNORECASE)
-    if not http_m:
-        http_m = re.search(r'<http>(.*?)</http>', text, re.IGNORECASE | re.DOTALL)
-    if http_m:
-        url = http_m.group(1).strip()
-        tool_header("🌐", "http", url)
-        result, ok_f = http_fetch(url)
-        tool_result_box(result, ok_f)
-        return True, result
-
-    # edit
-    edit_m = re.search(
-        r'<edit\s+file=["\']([^"\']+)["\']\s+pattern=["\']([^"\']+)["\'][^>]*>(.*?)</edit>',
-        text, re.IGNORECASE | re.DOTALL)
-    if edit_m:
-        filepath, pattern, replacement = edit_m.group(1), edit_m.group(2), edit_m.group(3)
-        tool_header("✏️", "edit", filepath)
-        result, ok_f = edit_file(filepath, pattern, replacement)
-        tool_result_box(result, ok_f)
-        return True, result
-
-    # move / copy
-    for tag in ['move', 'copy']:
-        m = re.search(rf'<{tag}\s+([^>]+?)\s*/?>', text, re.IGNORECASE)
-        if m:
-            attrs = m.group(1)
-            src   = re.search(r'src=["\']([^"\']+)["\']', attrs)
-            dst   = re.search(r'dest=["\']([^"\']+)["\']', attrs)
-            if src and dst:
-                icon = "📦" if tag == "move" else "📋"
-                tool_header(icon, tag, f"{src.group(1)} → {dst.group(1)}")
-                fn = move_file if tag == "move" else copy_file
-                result, ok_f = fn(src.group(1), dst.group(1))
-                tool_result_box(result, ok_f)
-                return True, result
-
-    return False, ""
-
-# ══════════════════════════════════════════════════════════════════════
-#  INFERENCE
-# ══════════════════════════════════════════════════════════════════════
-
-def run_inference(messages):
-    global _msg_count
-    payload = {
-        "model":   cfg["model"],
-        "messages": messages,
-        "stream":   cfg["stream"],
-        "options": {
-            "temperature": cfg["temperature"],
-            "num_ctx":     cfg["ctx"],
-            "top_p":       cfg["top_p"],
-        }
-    }
-    if cfg["max_tokens"] > 0:
-        payload["options"]["num_predict"] = cfg["max_tokens"]
-
-    if cfg["stream"]:
-        print(f"\n  {c(C.CYAN+C.B,'◈ ARIA')}: ", end="", flush=True)
-        full = ""
-        t0   = time.time()
-        try:
-            resp = requests.post(CHAT_URL, json=payload, stream=True, timeout=120)
-            tok_count = 0
-            for line in resp.iter_lines():
-                if line:
-                    data  = json.loads(line)
-                    chunk = data.get("message", {}).get("content", "")
-                    full += chunk
-                    tok_count += 1
-                    sys.stdout.write(chunk)
-                    sys.stdout.flush()
-                    if data.get("done"):
-                        elapsed = time.time() - t0
-                        # subtle stats after reply
-                        print(f"\n  {c(C.GRAY+C.DIM, f'{elapsed:.1f}s')}")
-                        break
-            _msg_count += 1
-            return full
-        except Exception as e:
-            err(f"Ollama error: {e}")
-            return None
-    else:
-        spin = Spinner("thinking").start()
-        try:
-            resp = requests.post(CHAT_URL, json=payload, timeout=120)
-            spin.stop()
-            if resp.status_code == 200:
-                reply = resp.json().get("message", {}).get("content", "")
-                print(f"\n  {c(C.CYAN+C.B,'◈ ARIA')}: {reply}\n")
-                _msg_count += 1
-                return reply
-            else:
-                err(f"Ollama error: {resp.status_code}")
-                return None
-        except Exception as e:
-            spin.stop()
-            err(f"Ollama error: {e}")
-            return None
-
-# ══════════════════════════════════════════════════════════════════════
-#  KNOWN COMMANDS (for suggestions)
-# ══════════════════════════════════════════════════════════════════════
-
-KNOWN_COMMANDS = [
-    '/exit', '/clear', '/model', '/allow', '/reconfigure',
-    '/save', '/load', '/help', '/ls', '/pwd', '/status',
-]
-
-# ══════════════════════════════════════════════════════════════════════
-#  COMMAND HANDLER
-# ══════════════════════════════════════════════════════════════════════
-
-def handle_command(cmd):
-    parts = cmd.split()
-    verb  = parts[0].lower()
-
-    if verb == '/exit':
-        show_exit_stats()
-        save_readline_history()
-        sys.exit(0)
-
-    elif verb == '/clear':
-        return "clear"
-
-    elif verb == '/ls':
-        path = parts[1] if len(parts) > 1 else "."
-        result, ok_f = list_directory(path)
-        print()
-        tool_result_box(result, ok_f)
-
-    elif verb == '/pwd':
-        ok(os.getcwd())
-
-    elif verb == '/status':
-        show_status()
-
-    elif verb == '/model':
-        if len(parts) > 1:
-            cfg['model'] = parts[1]
-            save_config()
-            ok(f"Model → {parts[1]}")
-        else:
-            warn("Usage: /model <name>")
-
-    elif verb == '/allow':
-        if len(parts) == 3:
-            feature, state = parts[1].lower(), parts[2].lower()
-            if feature in ('shell', 'network', 'write'):
-                val = state in ('true', '1', 'yes', 'on')
-                cfg[f'allow_{feature}'] = val
-                save_config()
-                label = c(C.GREEN if val else C.GRAY, "ON" if val else "OFF")
-                ok(f"{feature} access {label}")
-                if feature == 'shell' and val:
-                    warn("Shell is enabled. Be careful.")
-            else:
-                warn("Features: shell  network  write")
-        else:
-            warn("Usage: /allow <shell|network|write> <true|false>")
-
-    elif verb == '/reconfigure':
-        first_time_setup()
-        return "reload"
-
-    elif verb == '/save':
-        session_file = SESSION_DIR / f"session_{int(time.time())}.json"
-        session_data = {
-            "timestamp": time.time(),
-            "messages":  messages_history,
-            "cfg":       cfg,
-            "cwd":       os.getcwd()
-        }
-        session_file.write_text(json.dumps(session_data, indent=2), encoding='utf-8')
-        ok(f"Session saved → {session_file.name}")
-
-    elif verb == '/load':
-        if len(parts) < 2:
-            warn("Usage: /load <file>"); return
-        name = parts[1]
-        sf   = Path(name)
-        if not sf.exists():
-            sf = SESSION_DIR / name
-        if not sf.exists():
-            err("Session file not found"); return
-        try:
-            data = json.loads(sf.read_text(encoding='utf-8'))
-            messages_history[:] = data.get("messages", [])
-            cfg.update(data.get("cfg", {}))
-            saved_cwd = data.get("cwd")
-            if saved_cwd and Path(saved_cwd).exists():
-                os.chdir(saved_cwd)
-            ok(f"Loaded session from {sf.name}")
-            return "load"
-        except Exception as e:
-            err(f"Load failed: {e}")
-
-    elif verb == '/help':
-        show_help()
-
-    else:
-        suggestion = suggest_command(verb, KNOWN_COMMANDS)
-        if suggestion:
-            warn(f"Unknown command: {verb}  —  did you mean {c(C.CYAN, suggestion)}?")
-        else:
-            warn(f"Unknown command: {verb}  (try /help)")
-
-    return None
-
-# ══════════════════════════════════════════════════════════════════════
-#  HELP & STATUS
-# ══════════════════════════════════════════════════════════════════════
-
-def show_help():
-    rows = [
-        ("/exit",                "Exit ARIA"),
-        ("/clear",               "Clear conversation history"),
-        ("/model <name>",        "Switch Ollama model"),
-        ("/allow <feat> <bool>", "Toggle shell / network / write"),
-        ("/reconfigure",         "Run first-time setup again"),
-        ("/save",                "Save current session to file"),
-        ("/load <file>",         "Load a saved session"),
-        ("/ls [path]",           "List directory (shortcut)"),
-        ("/pwd",                 "Print working directory"),
-        ("/status",              "Show config & session stats"),
-        ("/help",                "This help screen"),
-    ]
-    print()
-    rule()
-    print(f"  {c(C.CYAN+C.B, 'Commands')}")
-    rule()
-    for cmd, desc in rows:
-        print(f"  {c(C.WHITE+C.B, cmd.ljust(26))} {c(C.GRAY, desc)}")
-    rule()
-    info("↑ / ↓ to navigate history   ·   Ctrl+C to interrupt   ·   Ctrl+D to exit")
-    print()
-
-def show_status():
-    print()
-    rule()
-    print(f"  {c(C.CYAN+C.B, 'Session status')}")
-    rule()
-    print(f"  {c(C.GRAY,'model')}     {c(C.WHITE, cfg['model'])}")
-    print(f"  {c(C.GRAY,'messages')}  {c(C.WHITE, str(_msg_count))}")
-    print(f"  {c(C.GRAY,'uptime')}    {c(C.WHITE, uptime_str())}")
-    print(f"  {c(C.GRAY,'cwd')}       {c(C.WHITE, os.getcwd())}")
-    print(f"  {c(C.GRAY,'shell')}     {c(C.GREEN if cfg['allow_shell']   else C.GRAY, str(cfg['allow_shell']))}")
-    print(f"  {c(C.GRAY,'network')}   {c(C.GREEN if cfg['allow_network'] else C.GRAY, str(cfg['allow_network']))}")
-    print(f"  {c(C.GRAY,'write')}     {c(C.GREEN if cfg['allow_write']   else C.GRAY, str(cfg['allow_write']))}")
-    rule()
-    print()
-
-def show_exit_stats():
-    print()
-    rule()
-    print(f"  {c(C.CYAN, 'Session summary')}")
-    print(f"  {c(C.GRAY, 'messages')}  {c(C.WHITE, str(_msg_count))}"
-          f"   {c(C.GRAY, 'uptime')}  {c(C.WHITE, uptime_str())}"
-          f"   {c(C.GRAY, 'model')}  {c(C.WHITE, cfg['model'])}")
-    rule()
-    print(f"  {c(C.GRAY+C.DIM, 'goodbye ✦')}")
-    print()
-
-# ══════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════
-
-messages_history = []
-
-def main():
-    global messages_history
-    load_config()
-    load_model_memory()
-    setup_readline()
-
-    if not MODEL_MEMORY_FILE.exists():
-        first_time_setup()
-    else:
-        cfg["allow_shell"] = model_memory.get("shell_enabled", False)
-        save_config()
-
-    banner()
-    messages_history = [{"role": "system", "content": system_prompt()}]
-
-    while True:
-        try:
-            user_input = input(prompt_line()).strip()
-            if not user_input:
-                continue
-
-            if user_input.startswith('/'):
-                cmd_res = handle_command(user_input)
-                if cmd_res == "clear":
-                    messages_history = [{"role": "system", "content": system_prompt()}]
-                    ok("Conversation cleared.")
-                elif cmd_res == "reload":
-                    messages_history[0] = {"role": "system", "content": system_prompt()}
-                    ok("Preferences reloaded.")
-                continue
-
-            messages_history.append({"role": "user", "content": user_input})
-
-            for _ in range(MAX_TOOL_LOOPS):
-                reply = run_inference(messages_history)
-                if not reply:
+# ── forgiving tool-call extraction ─────────────────────────────────
+def extract_tool(text):
+    """Find first complete JSON object containing a "tool" key. Returns (obj, start, end) or (None,-1,-1)."""
+    if '"tool"' not in text:
+        return None, -1, -1
+    for m in re.finditer(r"\{", text):
+        s = m.start()
+        depth, instr, escp = 0, False, False
+        for i in range(s, len(text)):
+            ch = text[i]
+            if instr:
+                if escp: escp = False
+                elif ch == "\\": escp = True
+                elif ch == '"': instr = False
+            elif ch == '"': instr = True
+            elif ch == "{": depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    chunk = text[s:i + 1]
+                    if '"tool"' in chunk:
+                        try:
+                            obj = json.loads(chunk)
+                            if isinstance(obj, dict) and "tool" in obj:
+                                return obj, s, i + 1
+                        except ValueError:
+                            pass
                     break
-                messages_history.append({"role": "assistant", "content": reply})
-                tool_used, tool_result = process_tools(reply)
-                if tool_used:
-                    info("feeding result back…")
-                    messages_history.append({
-                        "role": "user",
-                        "content": f"[Tool Result]\n{tool_result}\n\nProceed with the next step or provide final answer."
-                    })
+    return None, -1, -1
+
+# ── LLM streaming ──────────────────────────────────────────────────
+def llm_stream(cfg, messages):
+    base = cfg["baseUrl"].rstrip("/")
+    if cfg["platform"] == "ollama":
+        url = base + "/api/chat"
+        body = {"model": cfg["model"], "messages": messages, "stream": True,
+                "options": {"temperature": cfg.get("temp", 0.7)}}
+    else:
+        if not base.endswith("/v1"): base += "/v1"
+        url = base + "/chat/completions"
+        body = {"model": cfg["model"], "messages": messages, "stream": True,
+                "temperature": cfg.get("temp", 0.7)}
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data:"): line = line[5:].strip()
+            if not line or line == "[DONE]": continue
+            try: j = json.loads(line)
+            except ValueError: continue
+            tok = (j.get("message", {}) or {}).get("content", "") if cfg["platform"] == "ollama" \
+                else ((j.get("choices") or [{}])[0].get("delta", {}) or {}).get("content", "")
+            if tok: yield tok
+
+# ── agent loop ─────────────────────────────────────────────────────
+TRAIL = re.compile(r"(```json|```|<<tool>>|\s)+$")
+
+def run_agent(cfg, history, emit):
+    sysp = cfg.get("sysPrompt", "You are Aria (Autonomous Reasoning Intelligent Agent), a local AI agent.")
+    if cfg.get("deepResearch"):
+        sysp += " Deep-research mode: plan multi-step search/browse investigations, verify claims, give a structured report."
+    messages = [{"role": "system", "content": sysp + "\n\n" + TOOL_SPEC}] + history
+    bad = 0
+
+    for _ in range(MAX_TURNS):
+        full, emitted, call = "", 0, None
+        for tok in llm_stream(cfg, messages):
+            full += tok
+            # hold back anything that might be the start of tool JSON
+            idxs = [i for i in (full.find('"tool"'), full.find("<<tool")) if i != -1]
+            if idxs:
+                idx = min(idxs)
+                brace = full.rfind("{", 0, idx)
+                limit = brace if brace != -1 else idx
+            else:
+                limit = len(full) - 12
+            if limit > emitted:
+                emit({"type": "token", "text": full[emitted:limit]}); emitted = limit
+            obj, s, e = extract_tool(full)
+            if obj:
+                call = (obj, s); break
+
+        if call is None:
+            if '"tool"' in full or "<<tool" in full:        # malformed attempt
+                bad += 1
+                if bad > 2:
+                    emit({"type": "token", "text": "\n\n⚠️ The model kept producing malformed tool calls. Try a larger / more instruction-tuned model."})
+                    emit({"type": "done"}); return
+                messages += [{"role": "assistant", "content": full},
+                             {"role": "user", "content": 'Your tool call was malformed. Reply with ONLY valid JSON like {"tool":"shell","args":{"command":"ls"}} and nothing else.'}]
+                continue
+            if len(full) > emitted:                          # plain answer
+                emit({"type": "token", "text": full[emitted:]})
+            emit({"type": "done"}); return
+
+        obj, s = call
+        pre = TRAIL.sub("", full[:s])
+        if len(pre) > emitted:
+            emit({"type": "token", "text": pre[emitted:]})
+        name, args = obj.get("tool"), obj.get("args", {}) or {}
+        cid, detail = uuid.uuid4().hex[:8], tool_detail(name, args)
+
+        if name not in TOOLS:
+            result = f"ERROR: unknown tool '{name}'. Valid: {', '.join(TOOLS)}"
+        else:
+            flag = CONFIRM.get(name)
+            if flag and cfg.get(flag, True):
+                emit({"type": "tool", "id": cid, "tool": name, "detail": detail, "status": "confirm"})
+                ev = threading.Event(); PENDING[cid] = {"ev": ev, "approved": None}
+                ev.wait(300)
+                if not PENDING.pop(cid, {}).get("approved"):
+                    emit({"type": "tool_end", "id": cid, "ok": False, "output": "Denied by user"})
+                    messages += [{"role": "assistant", "content": full},
+                                 {"role": "user", "content": f"Tool result for {name}:\nUser DENIED this action. Do not retry it. Adjust or explain."}]
+                    continue
+                emit({"type": "tool", "id": cid, "tool": name, "detail": detail, "status": "run"})
+            else:
+                emit({"type": "tool", "id": cid, "tool": name, "detail": detail, "status": "run"})
+            try:
+                result = TOOLS[name](args)
+            except KeyError as e:
+                result = f"ERROR: missing arg {e}"
+            except Exception as e:
+                result = f"ERROR: {e}"
+
+        emit({"type": "tool_end", "id": cid, "ok": not str(result).startswith("ERROR"),
+              "output": str(result)[:2500]})
+        messages += [{"role": "assistant", "content": full},
+                     {"role": "user", "content": f"Tool result for {name}:\n{result}\n\nContinue: call another tool if needed, otherwise give the final answer in plain language (no JSON)."}]
+
+    emit({"type": "token", "text": "\n\n⚠️ Reached the tool-call limit for one message."})
+    emit({"type": "done"})
+
+# ── HTTP server ────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def _json(self, obj, code=200):
+        b = json.dumps(obj).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+
+    def do_GET(self):
+        p = urllib.parse.urlparse(self.path)
+        if p.path == "/":
+            b = HTML.encode()
+            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        elif p.path == "/api/models":
+            q = urllib.parse.parse_qs(p.query)
+            plat, url = q.get("platform", [""])[0], q.get("url", [""])[0].rstrip("/")
+            try:
+                if plat == "ollama":
+                    r = json.loads(urllib.request.urlopen(url + "/api/tags", timeout=4).read())
+                    models = [m["name"] for m in r.get("models", [])]
                 else:
-                    break
+                    if not url.endswith("/v1"): url += "/v1"
+                    r = json.loads(urllib.request.urlopen(url + "/models", timeout=4).read())
+                    models = [m["id"] for m in r.get("data", [])]
+                self._json({"ok": True, "models": models, "cwd": ROOT})
+            except Exception as e:
+                self._json({"ok": False, "error": str(e), "cwd": ROOT})
+        else:
+            self.send_error(404)
 
-        except KeyboardInterrupt:
-            print(f"\n  {c(C.GRAY+C.DIM, 'interrupted — /exit to quit')}")
-        except EOFError:
-            show_exit_stats()
-            save_readline_history()
-            break
+    def do_POST(self):
+        data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0) or b"{}")
+        if self.path == "/api/approve":
+            e = PENDING.get(data.get("id"))
+            if e: e["approved"] = bool(data.get("approved")); e["ev"].set()
+            self._json({"ok": True})
+        elif self.path == "/api/chat":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache"); self.end_headers()
+            def emit(o):
+                self.wfile.write(f"data: {json.dumps(o)}\n\n".encode()); self.wfile.flush()
+            try:
+                run_agent(data["cfg"], data["messages"], emit)
+            except (BrokenPipeError, ConnectionError):
+                pass
+            except Exception as e:
+                try: emit({"type": "error", "text": str(e)}); emit({"type": "done"})
+                except Exception: pass
+        else:
+            self.send_error(404)
+
+# ── UI ─────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Aria</title><style>
+:root{--bg:#fff;--soft:#f6f6f8;--softer:#fafafb;--bd:#e6e7eb;--bdh:#d2d5dc;--tx:#16181d;--mut:#6b7280;--dim:#9aa0ad;
+--ac:#16181d;--acs:rgba(22,24,29,.08);--ok:#16a36b;--err:#d92d3f;--warn:#c98a1b;--rs:10px;--msg:14.5px;--maxw:740px;
+--ink:linear-gradient(120deg,#15171c,#4b4f59 45%,#8a8f9b);--pre:#16181d;--pretx:#e6e8ee;
+--mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',Roboto,sans-serif;
+--sh:0 1px 2px rgba(20,22,28,.05),0 8px 28px rgba(20,22,28,.08);--ease:cubic-bezier(.2,.8,.2,1)}
+[data-theme=dark]{--bg:#101114;--soft:#16171b;--softer:#1a1b20;--bd:#26282e;--bdh:#34373f;--tx:#ececf0;--mut:#9aa1ad;
+--dim:#646c7a;--acs:rgba(236,236,240,.08);--ink:linear-gradient(120deg,#f2f3f6,#b9bec9 45%,#7e8693);--pre:#0a0b0d;
+--sh:0 1px 2px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.35)}
+[data-theme=dark] .splashbg{background:linear-gradient(160deg,#16171b,#101114)!important}
+*{margin:0;padding:0;box-sizing:border-box}html,body{height:100%}
+body{font-family:var(--sans);background:var(--bg);color:var(--tx);font-size:14px;line-height:1.55;overflow:hidden}
+button{font:inherit;color:inherit;background:none;border:none;cursor:pointer}
+input,select,textarea{font:inherit;color:inherit}
+::-webkit-scrollbar{width:9px}::-webkit-scrollbar-thumb{background:var(--bdh);border-radius:8px;border:2px solid var(--bg)}
+#splash{position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;
+background:linear-gradient(160deg,#fff,#f4f5f7 45%,#eceef2);transition:opacity .4s}
+#splash.fade{opacity:0;pointer-events:none}
+#splash h1{font-size:clamp(32px,6vw,54px);font-weight:700;letter-spacing:-.03em;background:var(--ink);
+-webkit-background-clip:text;background-clip:text;color:transparent;opacity:0;animation:wIn .6s var(--ease) .05s forwards}
+@keyframes wIn{from{opacity:0;transform:translateY(12px);filter:blur(4px)}to{opacity:1;transform:none;filter:none}}
+#setupOv{position:fixed;inset:0;z-index:250;display:none;align-items:center;justify-content:center;background:var(--soft);padding:24px}
+#setupOv.show{display:flex}
+.panel{width:min(480px,100%);background:var(--bg);border:1px solid var(--bd);border-radius:18px;padding:32px 34px 26px;box-shadow:var(--sh);animation:wIn .35s var(--ease)}
+.step{display:none}.step.active{display:block}
+.panel h2{font-size:20px;font-weight:700;background:var(--ink);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:4px}
+.panel .sub{color:var(--mut);font-size:13.5px;margin-bottom:20px}
+.f{margin-bottom:13px}.f label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin-bottom:5px}
+.f select,.f input{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--softer);outline:none}
+.f input{font-family:var(--mono);font-size:13px}
+.tline{display:flex;align-items:center;gap:8px;font-size:12.5px;min-height:18px;margin:-3px 0 9px}
+.tline .d{width:8px;height:8px;border-radius:50%}
+.acts{display:flex;justify-content:space-between;align-items:center;margin-top:18px}
+.btn{padding:10px 22px;border-radius:11px;background:var(--ac);color:var(--bg);font-weight:600}
+[data-theme=dark] .btn{background:#ececf0;color:#16181d}
+.btn:disabled{opacity:.35;cursor:not-allowed}
+.bg2{color:var(--mut);padding:10px 12px;border-radius:11px}.bg2:hover{background:var(--soft);color:var(--tx)}
+#app{display:none;height:100%}#app.active{display:flex}
+aside{width:256px;flex-shrink:0;background:var(--soft);border-right:1px solid var(--bd);display:flex;flex-direction:column}
+.shead{display:flex;align-items:center;gap:10px;padding:15px 16px 10px}
+.mark{width:28px;height:28px;border-radius:8px;background:var(--ac);color:var(--bg);display:flex;align-items:center;justify-content:center;font-size:13px}
+[data-theme=dark] .mark{background:#ececf0;color:#16181d}
+.shead b{font-size:15px}
+.nav{padding:0 10px 6px;display:flex;flex-direction:column;gap:2px}
+.nbtn{display:flex;align-items:center;gap:10px;padding:8px 11px;border-radius:var(--rs);font-size:13.5px;font-weight:600;width:100%;text-align:left}
+.nbtn:hover{background:var(--acs)}.nbtn .ni{width:18px;text-align:center}
+.nbtn kbd{margin-left:auto;font-size:10px;color:var(--dim);border:1px solid var(--bd);border-radius:5px;padding:1px 5px;font-family:var(--mono)}
+.nbtn.tog{background:var(--acs)}
+.slabel{font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);font-weight:700;padding:10px 18px 5px}
+#chatList{flex:1;overflow-y:auto;padding:0 10px 10px}
+.ci{display:flex;align-items:center;width:100%;padding:7px 8px 7px 11px;border-radius:var(--rs);color:var(--mut);font-size:13.5px;gap:6px;cursor:pointer}
+.ci span{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ci:hover{background:var(--acs);color:var(--tx)}.ci.on{background:var(--acs);color:var(--tx);font-weight:600}
+.ci .del{opacity:0;color:var(--dim);font-size:12px;padding:2px 5px;border-radius:6px}
+.ci:hover .del{opacity:1}.ci .del:hover{color:var(--err)}
+.sfoot{padding:11px 14px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:9px}
+.sdot{width:8px;height:8px;border-radius:50%;background:var(--warn);flex-shrink:0}.sdot.ok{background:var(--ok)}.sdot.err{background:var(--err)}
+.sfoot small{color:var(--mut);font-size:11.5px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.gear{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--mut)}
+.gear:hover{background:var(--acs);color:var(--tx)}
+main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
+.top{height:52px;flex-shrink:0;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:12px;padding:0 14px}
+.mdd{position:relative}
+.mdd>button{display:flex;align-items:center;gap:8px;padding:6px 11px;border-radius:10px;font-weight:700}
+.mdd>button:hover{background:var(--soft)}.mdd .car{color:var(--dim);font-size:10px}
+.menu{position:absolute;top:calc(100% + 6px);left:0;min-width:230px;max-height:300px;overflow-y:auto;background:var(--bg);border:1px solid var(--bd);border-radius:12px;box-shadow:var(--sh);padding:5px;z-index:50;display:none}
+.menu.open{display:block}
+.mi{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:8px 11px;border-radius:8px;font-size:13.5px}
+.mi:hover{background:var(--soft)}.mi .chk{margin-left:auto;font-weight:700;opacity:0}.mi.sel .chk{opacity:1}
+.top .title{font-weight:500;color:var(--mut);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mode{margin-left:auto;display:none;font-size:12px;font-weight:700;background:var(--acs);border-radius:99px;padding:5px 12px}
+.mode.show{display:flex}
+#stage{flex:1;display:flex;flex-direction:column;min-height:0}
+#scroll{flex:1;overflow-y:auto}
+#thread{max-width:var(--maxw);margin:0 auto;padding:26px 22px 12px;display:flex;flex-direction:column;gap:20px}
+#heroWrap{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:24px}
+main.empty #scroll{display:none}main.empty #heroWrap{display:flex}
+#heroGreet{font-size:clamp(22px,3.2vw,32px);font-weight:700;letter-spacing:-.025em;background:var(--ink);
+-webkit-background-clip:text;background-clip:text;color:transparent}
+.srow{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:640px}
+.sg{padding:7px 13px;border:1px solid var(--bd);border-radius:99px;background:var(--bg);font-size:12.5px;color:var(--mut)}
+.sg:hover{color:var(--tx);box-shadow:var(--sh)}
+#dock{padding:8px 22px 14px;flex-shrink:0}
+main.empty #dock{position:absolute;left:0;right:0;top:50%;transform:translateY(calc(-50% + 26px));padding:0 22px}
+.comp{max-width:var(--maxw);margin:0 auto;background:var(--bg);border:1px solid var(--bd);border-radius:18px;padding:12px 13px 9px;box-shadow:var(--sh)}
+.comp:focus-within{border-color:var(--bdh)}
+.comp textarea{width:100%;border:none;outline:none;resize:none;font-size:15px;max-height:200px;line-height:1.5;background:none}
+.cbar{display:flex;align-items:center;gap:6px;margin-top:7px}
+.chip{font-size:11.5px;color:var(--mut);border:1px solid var(--bd);border-radius:99px;padding:3px 10px;background:var(--softer)}
+.chip.dr{display:none;border-color:transparent;background:var(--acs);font-weight:700;color:var(--tx)}
+.chip.dr.show{display:inline-flex;gap:5px}
+#send{margin-left:auto;width:34px;height:34px;border-radius:11px;background:var(--ac);color:var(--bg);display:flex;align-items:center;justify-content:center;transition:transform .1s}
+[data-theme=dark] #send{background:#ececf0;color:#16181d}
+#send:hover{transform:scale(1.06)}#send:disabled{opacity:.22;cursor:not-allowed;transform:none}
+#send.stop{background:var(--err);color:#fff}
+.fnote{max-width:var(--maxw);margin:7px auto 0;text-align:center;color:var(--dim);font-size:11px}
+main.empty .fnote{display:none}
+.msg{display:flex;gap:13px;animation:mIn .15s var(--ease);position:relative}
+@keyframes mIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+.av{width:28px;height:28px;border-radius:9px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:12px;margin-top:2px}
+.msg.user .av{background:var(--acs)}.msg.agent .av{background:var(--ac);color:var(--bg)}
+[data-theme=dark] .msg.agent .av{background:#ececf0;color:#16181d}
+.bub{flex:1;min-width:0}
+.who{font-size:12px;font-weight:700;margin-bottom:2px;display:flex;align-items:center;gap:8px}
+.who .t{font-weight:400;color:var(--dim);font-size:11px}body.nots .who .t{display:none}
+.cp{opacity:0;margin-left:auto;color:var(--dim);font-size:12px;padding:2px 7px;border-radius:6px}
+.msg:hover .cp{opacity:1}.cp:hover{background:var(--soft);color:var(--tx)}
+.ct{font-size:var(--msg);white-space:pre-wrap;word-wrap:break-word}
+.ct code{font-family:var(--mono);background:var(--soft);border:1px solid var(--bd);padding:1px 5px;border-radius:5px;font-size:.86em}
+.ct pre{background:var(--pre);border-radius:var(--rs);padding:13px;overflow-x:auto;margin:9px 0;white-space:pre}
+.ct pre code{background:none;border:none;padding:0;color:var(--pretx);font-size:12.8px}
+.cur{display:inline-block;width:8px;height:15px;background:var(--tx);vertical-align:-2px;border-radius:2px;animation:bl 1s steps(1) infinite}
+@keyframes bl{50%{opacity:0}}
+.pw{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:12.5px;padding:4px 0}
+.pu{width:13px;height:13px;border-radius:50%;background:var(--tx);animation:pu 1.1s ease-in-out infinite}
+@keyframes pu{0%,100%{transform:scale(.55);opacity:.4}50%{transform:scale(1);opacity:1}}
+.tc{margin:7px 0 3px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--bg);overflow:hidden;font-size:13px}
+.th{display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--mut);cursor:pointer;flex-wrap:wrap}
+.th b{color:var(--tx);font-size:12.5px}
+.th .det{font-family:var(--mono);font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;max-width:320px;white-space:nowrap}
+.th .sp{width:12px;height:12px;border:2px solid var(--bdh);border-top-color:var(--tx);border-radius:50%;animation:rot .6s linear infinite;margin-left:auto}
+@keyframes rot{to{transform:rotate(360deg)}}
+.th .ok2{margin-left:auto;font-size:12px;font-weight:700;color:var(--ok)}.th .ok2.bad{color:var(--err)}
+.tconf{margin-left:auto;display:flex;gap:6px}
+.tconf button{font-size:11.5px;font-weight:700;padding:4px 12px;border-radius:99px}
+.tconf .y{background:var(--ac);color:var(--bg)}[data-theme=dark] .tconf .y{background:#ececf0;color:#16181d}
+.tconf .n{border:1px solid var(--bd);color:var(--mut)}
+.tb{display:none;border-top:1px solid var(--bd);padding:9px 12px;font-family:var(--mono);font-size:12.2px;color:var(--mut);white-space:pre-wrap;max-height:170px;overflow-y:auto;background:var(--softer)}
+.tc.open .tb{display:block}
+#setOv{position:fixed;inset:0;z-index:130;background:rgba(0,0,0,.3);display:none}
+#setOv.show{display:block}
+.set{position:absolute;top:0;right:0;bottom:0;width:min(380px,100%);background:var(--bg);border-left:1px solid var(--bd);
+box-shadow:var(--sh);padding:22px 24px;overflow-y:auto;transform:translateX(100%);transition:transform .22s var(--ease)}
+#setOv.show .set{transform:none}
+.set h3{font-size:17px}.set .x{position:absolute;top:16px;right:16px;width:28px;height:28px;border-radius:8px;color:var(--mut)}
+.set .x:hover{background:var(--soft)}
+.sec{margin-top:20px}.sec>label{display:block;font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin-bottom:8px}
+.sr{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:7px 0;font-size:13.5px}
+.sr .s2{color:var(--dim);font-size:11.5px;display:block}
+.sr input[type=range]{width:120px;accent-color:var(--tx)}
+.sw{display:flex;gap:7px}
+.swb{width:26px;height:26px;border-radius:50%;border:2px solid transparent}
+.swb.sel{border-color:var(--tx);box-shadow:inset 0 0 0 2px var(--bg)}
+.seg{display:flex;border:1px solid var(--bd);border-radius:99px;overflow:hidden}
+.seg button{padding:4px 12px;font-size:12px;font-weight:600;color:var(--mut)}
+.seg button.on{background:var(--ac);color:var(--bg)}[data-theme=dark] .seg button.on{background:#ececf0;color:#16181d}
+.tgl{width:34px;height:19px;border-radius:99px;background:var(--bdh);position:relative;transition:background .15s;flex-shrink:0}
+.tgl::after{content:'';position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:var(--bg);transition:left .15s}
+.tgl.on{background:var(--ok)}.tgl.on::after{left:17px}
+.set textarea,.set input[type=text]{width:100%;padding:8px 11px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--softer);outline:none;font-size:13px}
+.set textarea{resize:vertical;min-height:60px}
+.lk{font-size:13px;font-weight:600;padding:7px 0;color:var(--tx);text-decoration:underline}
+@media(max-width:760px){aside{display:none}}
+</style></head><body>
+<div id="splash" class="splashbg"><h1 id="wt">Welcome, user.</h1></div>
+<div id="setupOv"><div class="panel">
+ <div class="step active" data-step="1"><h2>Choose your platform</h2><p class="sub">Which local model runtime are you using?</p>
+  <div class="f"><label>Platform</label><select id="platform"><option value="" disabled selected>Select…</option>
+   <option value="ollama">Ollama</option><option value="lmstudio">LM Studio</option>
+   <option value="opencode">OpenCode</option><option value="other">Something else (OpenAI-compatible)</option></select></div>
+  <div class="acts"><span></span><button class="btn" id="s2" disabled>Continue</button></div></div>
+ <div class="step" data-step="2"><h2>Set it up</h2><p class="sub">Reconfigure anytime in ⚙ Settings.</p>
+  <div class="f"><label>Endpoint URL</label><input type="text" id="endpoint" spellcheck="false"></div>
+  <div class="tline" id="tline"></div>
+  <div class="f"><label>Default model</label><select id="setupModel"><option value="">— test to list models —</option></select></div>
+  <div class="acts"><button class="bg2" id="b1">← Back</button>
+   <div style="display:flex;gap:8px"><button class="bg2" id="testBtn">Test</button><button class="btn" id="finishBtn">Start →</button></div></div></div>
+</div></div>
+<div id="app"><aside>
+ <div class="shead"><div class="mark">✦</div><b>Aria</b></div>
+ <div class="nav">
+  <button class="nbtn" id="newChat"><span class="ni">✚</span>New Chat<kbd>⌘K</kbd></button>
+  <button class="nbtn" id="deepBtn"><span class="ni">◎</span>Deep research</button></div>
+ <div class="slabel">Chats</div><div id="chatList"></div>
+ <div class="sfoot"><div class="sdot" id="sdot"></div><small id="stext">Connecting…</small>
+  <button class="gear" id="gearBtn">⚙</button></div></aside>
+<main id="main" class="empty">
+ <div class="top">
+  <div class="mdd"><button id="modelBtn"><span id="modelName">—</span><span class="car">▼</span></button>
+   <div class="menu" id="modelMenu"></div></div>
+  <span class="title" id="chatTitle"></span><span class="mode" id="modeChip">◎ Deep research</span></div>
+ <div id="stage">
+  <div id="heroWrap"><div id="heroGreet">How can I help?</div>
+   <div class="srow" id="srow">
+    <button class="sg" data-p="What OS and hardware am I running on?">🖥️ System info</button>
+    <button class="sg" data-p="List the files here and summarize this project.">📖 Explore folder</button>
+    <button class="sg" data-p="Search the web for the latest stable Python version.">🔎 Web search</button>
+    <button class="sg" data-p="Run git status and summarize the repo state.">🌿 Git status</button></div></div>
+  <div id="scroll"><div id="thread"></div></div>
+  <div id="dock"><div class="comp">
+    <textarea id="input" rows="1" placeholder="Message Aria…"></textarea>
+    <div class="cbar"><span class="chip" id="provChip">—</span>
+     <span class="chip dr" id="drChip">◎ Deep research <button id="drOff">✕</button></span>
+     <button id="send" disabled>➤</button></div></div>
+   <div class="fnote">Real tools on your machine · Esc to stop · approve shell &amp; write actions</div></div>
+ </div></main></div>
+<div id="setOv"><div class="set">
+ <button class="x" id="xSet">✕</button><h3>Settings</h3>
+ <div class="sec"><label>Appearance</label>
+  <div class="sr"><span>Theme</span><div class="seg" id="themeSeg">
+   <button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="auto">Auto</button></div></div>
+  <div class="sr"><span>Accent</span><div class="sw" id="sw">
+   <button class="swb" data-c="#16181d" style="background:#16181d"></button>
+   <button class="swb" data-c="#3b6ef5" style="background:#3b6ef5"></button>
+   <button class="swb" data-c="#7c3aed" style="background:#7c3aed"></button>
+   <button class="swb" data-c="#16a36b" style="background:#16a36b"></button>
+   <button class="swb" data-c="#e25822" style="background:#e25822"></button></div></div>
+  <div class="sr"><span>Text size</span><input type="range" id="fsz" min="13" max="17" step="0.5"></div>
+  <div class="sr"><span>Chat width</span><div class="seg" id="widthSeg">
+   <button data-v="740px">Cozy</button><button data-v="940px">Wide</button></div></div>
+  <div class="sr"><span>Timestamps</span><button class="tgl" id="tsTgl"></button></div>
+  <div class="sr"><span>Auto-expand tool output</span><button class="tgl" id="expTgl"></button></div></div>
+ <div class="sec"><label>Personalization</label>
+  <div class="sr" style="display:block"><span style="display:block;margin-bottom:5px">Your name</span><input type="text" id="nm"></div>
+  <div class="sr" style="display:block"><span style="display:block;margin-bottom:5px">System prompt</span><textarea id="sp"></textarea></div>
+  <div class="sr"><span>Temperature<span class="s2" id="tv">0.7</span></span><input type="range" id="tp" min="0" max="2" step="0.1"></div></div>
+ <div class="sec"><label>Safety</label>
+  <div class="sr"><span>Confirm shell commands</span><button class="tgl" id="shT"></button></div>
+  <div class="sr"><span>Confirm file writes</span><button class="tgl" id="wrT"></button></div></div>
+ <div class="sec"><label>Connection</label>
+  <div class="sr"><span id="connInfo">—</span></div>
+  <button class="lk" id="reconfig">Change platform / endpoint →</button></div>
+</div></div>
+<script>
+(()=>{
+const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
+const K='aria.cfg',KC='aria.chats';
+const URLS={ollama:'http://localhost:11434',lmstudio:'http://localhost:1234/v1',opencode:'http://localhost:4096/v1',other:'http://localhost:8080/v1'};
+const PLAT={ollama:'🦙 Ollama',lmstudio:'🧪 LM Studio',opencode:'⌘ OpenCode',other:'⚙️ Custom'};
+const IC={read_file:'📖',write_file:'✏️',edit_file:'🪄',shell:'🖥️',search:'🔎',browse:'🌐'};
+const DEF={userName:'user',sysPrompt:'You are Aria (Autonomous Reasoning Intelligent Agent), a powerful local AI agent. Reason step by step, act autonomously with your tools, and be direct and concise.',temp:0.7,
+accent:'#16181d',fontSize:14.5,theme:'auto',width:'740px',timestamps:true,expandTools:false,
+confirmShell:true,confirmWrite:true,deepResearch:false};
+let cfg=null;try{cfg=JSON.parse(localStorage.getItem(K))}catch(e){}
+if(cfg)cfg={...DEF,...cfg};
+const st={chats:[],cur:null,busy:false,abort:null,online:false,models:[]};
+try{st.chats=JSON.parse(localStorage.getItem(KC))||[]}catch(e){}
+const save=()=>localStorage.setItem(K,JSON.stringify(cfg)),saveC=()=>localStorage.setItem(KC,JSON.stringify(st.chats));
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const md=s=>{let o=esc(s);o=o.replace(/```(\w*)\n([\s\S]*?)(```|$)/g,(_,l,c)=>`<pre><code>${c}</code></pre>`);
+ o=o.replace(/`([^`\n]+)`/g,'<code>$1</code>');return o.replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>')};
+function theme(){
+ const dark=cfg.theme==='dark'||(cfg.theme==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);
+ document.documentElement.dataset.theme=dark?'dark':'light';
+ const r=document.documentElement.style,n=parseInt(cfg.accent.slice(1),16);
+ r.setProperty('--ac',cfg.accent);r.setProperty('--acs',`rgba(${n>>16&255},${n>>8&255},${n&255},.1)`);
+ r.setProperty('--msg',cfg.fontSize+'px');r.setProperty('--maxw',cfg.width);
+ document.body.classList.toggle('nots',!cfg.timestamps)}
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>cfg&&theme());
+$('#wt').textContent=`Welcome, ${cfg?.userName||'user'}.`;if(cfg)theme();
+setTimeout(()=>{$('#splash').classList.add('fade');setTimeout(()=>cfg?enter():$('#setupOv').classList.add('show'),200)},1000);
+const goStep=n=>$$('.step').forEach(s=>s.classList.toggle('active',s.dataset.step==n));
+$('#platform').onchange=e=>$('#s2').disabled=!e.target.value;
+$('#s2').onclick=()=>{$('#endpoint').value=cfg?.baseUrl||URLS[$('#platform').value];$('#tline').innerHTML='';goStep(2)};
+$('#b1').onclick=()=>goStep(1);
+async function getModels(p,u){try{const r=await fetch(`/api/models?platform=${encodeURIComponent(p)}&url=${encodeURIComponent(u)}`);
+ const j=await r.json();return j.ok?j.models:null}catch(e){return null}}
+$('#testBtn').onclick=async()=>{const l=$('#tline');
+ l.innerHTML='<span class="d" style="background:var(--warn)"></span>Testing…';
+ const m=await getModels($('#platform').value,$('#endpoint').value.trim());
+ if(m){l.innerHTML=`<span class="d" style="background:var(--ok)"></span><span style="color:var(--ok)">Connected — ${m.length} models</span>`;
+  $('#setupModel').innerHTML=m.map(x=>`<option>${x}</option>`).join('')}
+ else l.innerHTML='<span class="d" style="background:var(--err)"></span><span style="color:var(--err)">Unreachable — start your runtime</span>'};
+$('#finishBtn').onclick=()=>{cfg={...DEF,...(cfg||{}),platform:$('#platform').value,
+ baseUrl:$('#endpoint').value.trim().replace(/\/$/,''),model:$('#setupModel').value||''};
+ save();$('#setupOv').classList.remove('show');enter()};
+async function connect(){const m=await getModels(cfg.platform,cfg.baseUrl);
+ if(m&&m.length){st.online=true;st.models=m;if(!m.includes(cfg.model))cfg.model=m[0];
+  $('#sdot').className='sdot ok';$('#stext').textContent='Connected · '+cfg.baseUrl.replace(/^https?:\/\//,'')}
+ else{st.online=false;st.models=[];$('#sdot').className='sdot err';$('#stext').textContent='Offline — start '+(PLAT[cfg.platform]||'runtime')}
+ mm();save()}
+function mm(){$('#modelName').textContent=cfg.model||'—';
+ $('#modelMenu').innerHTML=st.models.map(m=>`<button class="mi ${m===cfg.model?'sel':''}" data-m="${m}">${m}<span class="chk">✓</span></button>`).join('')
+ ||'<div style="padding:10px;color:var(--dim);font-size:12.5px">No models found</div>'}
+$('#modelBtn').onclick=e=>{e.stopPropagation();$('#modelMenu').classList.toggle('open')};
+$('#modelMenu').onclick=e=>{const i=e.target.closest('.mi');if(!i)return;
+ cfg.model=i.dataset.m;save();mm();$('#modelMenu').classList.remove('open')};
+document.addEventListener('click',()=>$('#modelMenu').classList.remove('open'));
+function enter(){theme();$('#app').classList.add('active');
+ $('#provChip').textContent=PLAT[cfg.platform]||cfg.platform;
+ $('#heroGreet').textContent=`How can I help, ${cfg.userName}?`;
+ if(!st.cur){st.cur=st.chats[0]||null;if(!st.cur)nc(true)}
+ sUI();rc();rt();connect();setTimeout(()=>$('#input').focus(),40)}
+function nc(s){const c={id:Date.now(),title:'New chat',msgs:[]};st.chats.unshift(c);st.cur=c;saveC();
+ if(!s){rc();rt();$('#input').focus()}}
+$('#newChat').onclick=()=>nc();
+document.addEventListener('keydown',e=>{
+ if((e.metaKey||e.ctrlKey)&&e.key==='k'){e.preventDefault();nc()}
+ if(e.key==='Escape'&&st.busy)st.abort?.abort()});
+function rc(){$('#chatList').innerHTML=st.chats.map(c=>
+ `<div class="ci ${c===st.cur?'on':''}" data-id="${c.id}"><span>${esc(c.title)}</span><button class="del" data-del="${c.id}">✕</button></div>`).join('')}
+$('#chatList').onclick=e=>{const d=e.target.closest('[data-del]');
+ if(d){st.chats=st.chats.filter(c=>c.id!=d.dataset.del);
+  if(st.cur?.id==d.dataset.del)st.cur=st.chats[0]||null;if(!st.cur)nc(true);saveC();rc();rt();return}
+ const i=e.target.closest('.ci');if(!i)return;st.cur=st.chats.find(c=>c.id==i.dataset.id);rc();rt()};
+$('#chatList').ondblclick=e=>{const i=e.target.closest('.ci');if(!i)return;
+ const c=st.chats.find(x=>x.id==i.dataset.id);const t=prompt('Rename chat:',c.title);
+ if(t){c.title=t.slice(0,60);saveC();rc();if(c===st.cur)$('#chatTitle').textContent=c.title}};
+$('#deepBtn').onclick=()=>{cfg.deepResearch=!cfg.deepResearch;save();dr()};
+$('#drOff').onclick=e=>{e.stopPropagation();cfg.deepResearch=false;save();dr()};
+function dr(){$('#deepBtn').classList.toggle('tog',cfg.deepResearch);
+ $('#modeChip').classList.toggle('show',cfg.deepResearch);$('#drChip').classList.toggle('show',cfg.deepResearch)}
+function rt(){const has=st.cur.msgs.length>0;$('#main').classList.toggle('empty',!has);
+ $('#chatTitle').textContent=has?st.cur.title:'';const t=$('#thread');t.innerHTML='';
+ st.cur.msgs.forEach(m=>t.appendChild(me(m)));sd(true)}
+function me(m){const d=document.createElement('div');d.className=`msg ${m.role==='user'?'user':'agent'}`;
+ d.innerHTML=`<div class="av">${m.role==='user'?'🧑':'✦'}</div><div class="bub">
+ <div class="who">${m.role==='user'?esc(cfg.userName):'Aria'}<span class="t">${m.time||''}</span>
+ <button class="cp" title="Copy">⧉</button></div><div class="tools"></div><div class="ct">${md(m.text||'')}</div></div>`;
+ d.querySelector('.cp').onclick=()=>navigator.clipboard?.writeText(m.text||'');return d}
+const sd=i=>{const s=$('#scroll');s.scrollTo({top:s.scrollHeight,behavior:i?'auto':'smooth'})};
+const now=()=>new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+function drop(){const m=$('#main');if(!m.classList.contains('empty'))return;
+ const d=$('#dock'),a=d.getBoundingClientRect();m.classList.remove('empty');
+ const b=d.getBoundingClientRect();
+ d.animate([{transform:`translateY(${a.top-b.top}px)`},{transform:'none'}],{duration:280,easing:'cubic-bezier(.2,.8,.2,1)'})}
+const inp=$('#input'),sb=$('#send');
+inp.oninput=()=>{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,200)+'px';
+ sb.disabled=!inp.value.trim()&&!st.busy};
+inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(inp.value.trim())send()}};
+sb.onclick=()=>{if(st.busy){st.abort?.abort();return}send()};
+$('#srow').onclick=e=>{const s=e.target.closest('.sg');if(!s)return;
+ inp.value=s.dataset.p;inp.dispatchEvent(new Event('input'));send()};
+async function send(){
+ const text=inp.value.trim();if(!text||st.busy)return;
+ inp.value='';inp.style.height='auto';
+ const c=st.cur;c.msgs.push({role:'user',text,time:now()});
+ if(c.title==='New chat'){c.title=text.slice(0,42)+(text.length>42?'…':'');rc()}
+ drop();$('#thread').appendChild(me(c.msgs[c.msgs.length-1]));$('#chatTitle').textContent=c.title;
+ const am={role:'assistant',text:'',time:now()};c.msgs.push(am);
+ const el=me(am);$('#thread').appendChild(el);
+ const ce=el.querySelector('.ct'),te=el.querySelector('.tools');
+ ce.innerHTML='<div class="pw"><div class="pu"></div>'+(cfg.deepResearch?'Researching…':'Thinking…')+'</div>';sd();
+ st.busy=true;sb.classList.add('stop');sb.textContent='■';sb.disabled=false;
+ st.abort=new AbortController();
+ const cards={};
+ const hist=c.msgs.filter(m=>m.text&&m!==am).map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}));
+ try{
+  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({cfg,messages:hist}),signal:st.abort.signal});
+  const rd=r.body.getReader(),dc=new TextDecoder();let buf='';
+  while(true){const{done,value}=await rd.read();if(done)break;
+   buf+=dc.decode(value,{stream:true});const ps=buf.split('\n\n');buf=ps.pop();
+   for(const p of ps){const l=p.replace(/^data:\s*/,'').trim();if(!l)continue;
+    let ev;try{ev=JSON.parse(l)}catch(e){continue}
+    if(ev.type==='token'){am.text+=ev.text;ce.innerHTML=md(am.text)+'<span class="cur"></span>';sd(true)}
+    else if(ev.type==='tool'){
+     if(!am.text)ce.innerHTML='';
+     let cd=cards[ev.id];
+     if(!cd){cd=document.createElement('div');cd.className='tc'+(cfg.expandTools?' open':'');cards[ev.id]=cd;te.appendChild(cd)}
+     const h=`<span>${IC[ev.tool]||'🔧'}</span><b>${ev.tool}</b><span class="det">${esc(ev.detail||'')}</span>`;
+     if(ev.status==='confirm'){
+      cd.innerHTML=`<div class="th">${h}<div class="tconf"><button class="n" data-a="0">Deny</button><button class="y" data-a="1">Approve</button></div></div>`;
+      cd.querySelector('.tconf').onclick=async e2=>{const b=e2.target.closest('button');if(!b)return;
+       cd.querySelector('.tconf').outerHTML=b.dataset.a==='1'?'<div class="sp"></div>':'<span class="ok2 bad">denied</span>';
+       await fetch('/api/approve',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({id:ev.id,approved:b.dataset.a==='1'})})}}
+     else cd.innerHTML=`<div class="th">${h}<div class="sp"></div></div>`;
+     sd(true)}
+    else if(ev.type==='tool_end'){const cd=cards[ev.id];if(!cd)continue;
+     const h=cd.querySelector('.th');h.querySelector('.sp')?.remove();h.querySelector('.tconf')?.remove();
+     if(!h.querySelector('.ok2'))h.insertAdjacentHTML('beforeend',`<span class="ok2 ${ev.ok?'':'bad'}">${ev.ok?'✓':'✕'}</span>`);
+     if(ev.output){const b=document.createElement('div');b.className='tb';b.textContent=ev.output;cd.appendChild(b);
+      h.onclick=()=>cd.classList.toggle('open')}
+     sd(true)}
+    else if(ev.type==='error')am.text+=(am.text?'\n\n':'')+'⚠️ '+ev.text}}
+ }catch(e){if(e.name!=='AbortError')am.text+=(am.text?'\n\n':'')+'⚠️ '+
+  (st.online?(e.message||'Connection error'):'Model offline — start '+(PLAT[cfg.platform]||'your runtime')+' and reconnect via ⚙.')}
+ ce.innerHTML=md(am.text)||'<span style="color:var(--dim)">［stopped］</span>';
+ st.busy=false;sb.classList.remove('stop');sb.textContent='➤';sb.disabled=!inp.value.trim();
+ saveC();sd()}
+function sUI(){
+ $$('#themeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===cfg.theme));
+ $$('#sw .swb').forEach(s=>s.classList.toggle('sel',s.dataset.c===cfg.accent));
+ $('#fsz').value=cfg.fontSize;
+ $$('#widthSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===cfg.width));
+ $('#tsTgl').classList.toggle('on',cfg.timestamps);$('#expTgl').classList.toggle('on',cfg.expandTools);
+ $('#nm').value=cfg.userName;$('#sp').value=cfg.sysPrompt;
+ $('#tp').value=cfg.temp;$('#tv').textContent=(+cfg.temp).toFixed(1);
+ $('#shT').classList.toggle('on',cfg.confirmShell);$('#wrT').classList.toggle('on',cfg.confirmWrite);
+ $('#connInfo').innerHTML=`${PLAT[cfg.platform]}<span class="s2">${esc(cfg.baseUrl)}</span>`;dr()}
+$('#gearBtn').onclick=()=>{sUI();$('#setOv').classList.add('show')};
+$('#xSet').onclick=()=>$('#setOv').classList.remove('show');
+$('#setOv').onclick=e=>{if(e.target===e.currentTarget)e.currentTarget.classList.remove('show')};
+$('#themeSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;cfg.theme=b.dataset.v;save();theme();sUI()};
+$('#sw').onclick=e=>{const s=e.target.closest('.swb');if(!s)return;cfg.accent=s.dataset.c;save();theme();sUI()};
+$('#fsz').oninput=e=>{cfg.fontSize=+e.target.value;save();theme()};
+$('#widthSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;cfg.width=b.dataset.v;save();theme();sUI()};
+$('#tsTgl').onclick=()=>{cfg.timestamps=!cfg.timestamps;save();theme();sUI()};
+$('#expTgl').onclick=()=>{cfg.expandTools=!cfg.expandTools;save();sUI()};
+$('#shT').onclick=()=>{cfg.confirmShell=!cfg.confirmShell;save();sUI()};
+$('#wrT').onclick=()=>{cfg.confirmWrite=!cfg.confirmWrite;save();sUI()};
+$('#nm').onchange=e=>{cfg.userName=e.target.value.trim()||'user';save();
+ $('#heroGreet').textContent=`How can I help, ${cfg.userName}?`};
+$('#sp').onchange=e=>{cfg.sysPrompt=e.target.value;save()};
+$('#tp').oninput=e=>{cfg.temp=+e.target.value;$('#tv').textContent=cfg.temp.toFixed(1);save()};
+$('#reconfig').onclick=()=>{$('#setOv').classList.remove('show');$('#app').classList.remove('active');
+ $('#platform').value=cfg.platform;$('#platform').dispatchEvent(new Event('change'));
+ $('#setupOv').classList.add('show');goStep(1)};
+})();
+</script></body></html>"""
 
 if __name__ == "__main__":
-    main()
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    print(f"✦ Aria → http://127.0.0.1:{PORT}\n  Workspace: {ROOT}")
+    threading.Timer(0.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
