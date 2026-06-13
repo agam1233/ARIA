@@ -1,1237 +1,1846 @@
 #!/usr/bin/env python3
 """
-Aria — Autonomous Reasoning Intelligent Agent. Standalone local AI agent with a web UI.
-Run:  python aria.py        (stdlib only, no installs)
-Opens http://127.0.0.1:8400 — tools operate in the launch directory.
-
-Network: the server listens on all interfaces (0.0.0.0) so other devices on your
-LAN can connect to http://<your-lan-ip>:8400. The FIRST device to ever connect
-becomes the trusted "host". Any other IP that connects must be approved by the
-host (a prompt appears in the host's UI). Until approved, that device just sees
-a "waiting for approval" screen and cannot use any tools.
+ARIA — Autonomous Reasoning Intelligent Agent  ·  Build 6
+Smarter · Faster · Cleaner · Code memory · 9b-tuned prompts
 """
-import json, os, re, signal, ssl, subprocess, threading, time, uuid, html as htmlmod
-import urllib.request, urllib.parse, urllib.error, webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-PORT = 8400
-ROOT = os.path.realpath(os.getcwd())
-PENDING = {}          # tool confirmation -> approval
-MAX_TURNS = 10
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+import ast, datetime, difflib, hashlib, io, json, os, re, shutil
+import signal, subprocess, sys, tempfile, textwrap, threading, time
+import traceback, zipfile
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
 
-# ── LAN access control ──────────────────────────────────────────────
-ACCESS = {"host": None, "trusted": set(), "pending": {}}  # pending: ip -> {"ts": float, "ua": str}
-ACCESS_LOCK = threading.Lock()
+try:
+    import readline
+except ImportError:
+    readline = None
 
-def access_check(ip):
-    """Returns 'ok', 'pending', or 'new' for a given client IP."""
-    with ACCESS_LOCK:
-        if ACCESS["host"] is None:
-            ACCESS["host"] = ip
-            ACCESS["trusted"].add(ip)
-            return "ok"
-        if ip == ACCESS["host"] or ip in ACCESS["trusted"]:
-            return "ok"
-        if ip in ACCESS["pending"]:
-            return "pending"
-        return "new"
+try:
+    import requests
+except ImportError:
+    sys.exit("Missing dependency: pip install requests")
 
-def access_register_pending(ip, ua):
-    with ACCESS_LOCK:
-        ACCESS["pending"][ip] = {"ts": time.time(), "ua": ua}
+# ── Constants ──────────────────────────────────────────────────────────
+VERSION        = "Build 6"
+DEFAULT_MODEL  = "qwen3.5:9b"
+OLLAMA_BASE    = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+CHAT_URL       = f"{OLLAMA_BASE}/api/chat"
+TAGS_URL       = f"{OLLAMA_BASE}/api/tags"
+HOME           = Path.home()
+SESSION_DIR    = HOME / ".aria_sessions"
+CONFIG_FILE    = HOME / ".aria_config.json"
+MEMORY_FILE    = HOME / ".aria_memory.json"
+BACKUP_DIR     = HOME / ".aria_backups"
+HISTORY_FILE   = HOME / ".aria_history"
+NOTES_FILE     = HOME / ".aria_notes.json"
+CODE_MEM_FILE  = HOME / ".aria_code_memory.json"   # NEW: /code mode memory
+PLUGINS_DIR    = HOME / ".aria_plugins"
+CRASH_FILE     = HOME / ".aria_crash.json"
 
-# ── active shell processes (so "stop" actually kills them) ──────────
-ACTIVE_SHELLS = {}  # threading.get_ident() -> Popen
+MAX_TOOL_LOOPS  = 32
+MAX_OUTPUT_LEN  = 14000
+CODE_MAX_ITER   = 10
+SANDBOX_TIMEOUT = 25
+CTX_COMPRESS_AT = 24
+CTX_KEEP_RECENT = 6
+MAX_RETRIES     = 2
 
-# ── tools ──────────────────────────────────────────────────────────
-TOOL_SPEC = f"""
-You have REAL tools.
+for _d in (SESSION_DIR, BACKUP_DIR, PLUGINS_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
-To CREATE or OVERWRITE a file, use this exact block (RAW content — no JSON, no escaping, no backticks):
-<<write:relative/path.ext>>
-...full file content here...
-<<end>>
+# ── Colors ─────────────────────────────────────────────────────────────
+class C:
+    R="\033[0m"; B="\033[1m"; DIM="\033[2m"; IT="\033[3m"
+    GRAY="\033[90m"; RED="\033[91m"; GREEN="\033[92m"; YEL="\033[93m"
+    BLUE="\033[94m"; MAG="\033[95m"; CYAN="\033[96m"; WHT="\033[97m"
+    DGRN="\033[32m"; DGRAY="\033[2;37m"
 
-For every OTHER tool, reply with ONLY a JSON object (no prose, no backticks), then STOP:
-{{"tool":"shell","args":{{"command":"uname -a"}}}}
-The result arrives as the next user message; continue from there (you may chain calls).
-Tools:
-- read_file   args: {{"path":"relative/path"}}
-- edit_file   args: {{"path":"relative/path","old_str":"...","new_str":"..."}} (old_str must be unique)
-- shell       args: {{"command":"..."}} (workspace cwd, 60s timeout)
-- search      args: {{"query":"..."}}
-- browse      args: {{"url":"https://..."}}
-Workspace: {ROOT}
-RULES:
-- NEVER put file content inside JSON — always use the <<write:...>> block for files.
-- NEVER describe a command in prose instead of calling it.
-- One tool call per reply. When done with tools, write a normal final answer (no JSON, no blocks).
-""".strip()
+def c(color: str, text: str) -> str: return f"{color}{text}{C.R}"
+def strip_ansi(s: str) -> str: return re.sub(r'\033\[[0-9;]*m', '', s)
 
-def safe_path(p):
-    full = os.path.realpath(os.path.join(ROOT, p))
-    if full != ROOT and not full.startswith(ROOT + os.sep):
-        raise ValueError("path escapes workspace")
-    return full
+# ── Runtime state ──────────────────────────────────────────────────────
+_start_time  = time.time()
+_msg_count   = 0
+_tool_counts: dict[str, int] = defaultdict(int)
+_token_total = 0
+_pystate: dict[str, Any] = {}
+messages_history: list[dict] = []
+_last_tool_result = ""
 
-def t_read_file(a):
-    with open(safe_path(a["path"]), encoding="utf-8", errors="replace") as f:
-        d = f.read()
-    return d[:12000] + ("\n…[truncated]" if len(d) > 12000 else "")
+# ── Config ─────────────────────────────────────────────────────────────
+DEFAULTS: dict = {
+    "model": DEFAULT_MODEL, "temperature": 0.3, "top_p": 0.95,
+    "ctx": 65536, "max_tokens": -1, "stream": True,
+    "search_n": 5, "allow_shell": False, "allow_network": True,
+    "allow_write": True, "danger_confirm": True, "autonomous": True,
+    "auto_compress": True, "show_diffs": True, "retry_on_fail": True,
+    "browser_cmd": "firefox", "editor_cmd": "code",
+    "projects_dir": str(HOME / "projects"), "fallback_model": "",
+}
+cfg: dict = dict(DEFAULTS)
 
-def t_write_file(a):
-    fp = safe_path(a["path"])
-    os.makedirs(os.path.dirname(fp) or ".", exist_ok=True)
-    with open(fp, "w", encoding="utf-8") as f:
-        f.write(a["content"])
-    return f"Wrote {len(a['content'])} bytes to {a['path']}"
+def load_config():
+    global cfg
+    if CONFIG_FILE.exists():
+        try: cfg.update(json.loads(CONFIG_FILE.read_text()))
+        except Exception: pass
+    for k, v in DEFAULTS.items(): cfg.setdefault(k, v)
 
-def t_edit_file(a):
-    fp = safe_path(a["path"])
-    with open(fp, encoding="utf-8") as f:
-        d = f.read()
-    n = d.count(a["old_str"])
-    if n != 1:
-        return f"ERROR: old_str found {n} times (need exactly 1)"
-    with open(fp, "w", encoding="utf-8") as f:
-        f.write(d.replace(a["old_str"], a["new_str"], 1))
-    return f"Edited {a['path']}"
+def save_config():
+    try: CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    except Exception: pass
 
-def t_shell(a):
-    ident = threading.get_ident()
+# ── Notes & memory ─────────────────────────────────────────────────────
+_notes: list[dict] = []
+
+def load_notes():
+    global _notes
+    try: _notes = json.loads(NOTES_FILE.read_text()) if NOTES_FILE.exists() else []
+    except Exception: _notes = []
+
+def save_notes():
+    try: NOTES_FILE.write_text(json.dumps(_notes, indent=2))
+    except Exception: pass
+
+def load_memory() -> dict:
+    try: return json.loads(MEMORY_FILE.read_text()) if MEMORY_FILE.exists() else {}
+    except Exception: return {}
+
+def save_memory(mem: dict):
+    try: MEMORY_FILE.write_text(json.dumps(mem, indent=2))
+    except Exception: pass
+
+# ── Code memory (persists across /code sessions) ───────────────────────
+def load_code_memory() -> dict:
+    """Persistent knowledge base across all /code sessions."""
+    try: return json.loads(CODE_MEM_FILE.read_text()) if CODE_MEM_FILE.exists() else {}
+    except Exception: return {}
+
+def save_code_memory(mem: dict):
+    try: CODE_MEM_FILE.write_text(json.dumps(mem, indent=2))
+    except Exception: pass
+
+def update_code_memory(task: str, outcome: str, files: list[str]):
+    """Record what was built, what worked, what failed."""
+    mem = load_code_memory()
+    entry = {
+        "time": datetime.datetime.now().isoformat(timespec='seconds'),
+        "task": task[:200],
+        "outcome": outcome[:400],
+        "files": files[:10],
+    }
+    mem.setdefault("sessions", []).append(entry)
+    mem["sessions"] = mem["sessions"][-30:]  # keep last 30
+    # Extract reusable patterns
+    if "error" not in outcome.lower() and files:
+        mem.setdefault("known_patterns", {})[task[:60]] = {
+            "files": files, "summary": outcome[:200]
+        }
+    save_code_memory(mem)
+
+# ── Readline ────────────────────────────────────────────────────────────
+_CMDS = ['/exit','/clear','/model','/allow','/save','/load','/help','/ls',
+         '/pwd','/status','/code','/auto','/note','/notes','/memory',
+         '/diff','/undo','/plugins','/explain','/compress','/temp','/reconfigure']
+
+def setup_readline():
+    if not readline: return
     try:
-        proc = subprocess.Popen(
-            a["command"], shell=True, cwd=ROOT,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-            preexec_fn=os.setsid,
-        )
-        ACTIVE_SHELLS[ident] = proc
-        try:
-            out, _ = proc.communicate(timeout=60)
-        except subprocess.TimeoutExpired:
-            _kill_proc(proc)
-            return "ERROR: timed out (60s)"
-        return f"exit {proc.returncode}\n{(out or '(no output)').strip()[:6000]}"
-    except KeyboardInterrupt:
-        return "ERROR: stopped by user"
-    finally:
-        ACTIVE_SHELLS.pop(ident, None)
+        if HISTORY_FILE.exists(): readline.read_history_file(str(HISTORY_FILE))
+        readline.set_history_length(2000)
+        readline.parse_and_bind("tab: complete")
+        readline.set_completer(
+            lambda t, s: ([x for x in _CMDS if x.startswith(t)] + [None])[s])
+    except Exception: pass
 
-def _kill_proc(proc):
+def save_readline_history():
+    if not readline: return
+    try: readline.write_history_file(str(HISTORY_FILE))
+    except Exception: pass
+
+# ── Utilities ───────────────────────────────────────────────────────────
+def term_width() -> int:
+    try: return min(os.get_terminal_size().columns, 120)
+    except: return 80
+
+def rule(char="─", color=C.GRAY):
+    print(f"  {c(color, char * min(term_width()-4, 76))}")
+
+def trunc(text: str, n: int = MAX_OUTPUT_LEN) -> str:
+    if len(text) <= n: return text
+    half = n // 2
+    return (text[:half]
+            + f"\n{c(C.YEL,'…')} {c(C.GRAY,f'[{len(text)-n:,} chars omitted]')} {c(C.YEL,'…')}\n"
+            + text[-half:])
+
+def uptime() -> str:
+    s = int(time.time() - _start_time)
+    return f"{s//3600}h {(s%3600)//60}m" if s >= 3600 else (f"{s//60}m {s%60}s" if s >= 60 else f"{s}s")
+
+def udiff(orig: str, new: str, name: str = "file") -> str:
+    return "".join(difflib.unified_diff(
+        orig.splitlines(True), new.splitlines(True),
+        fromfile=f"a/{name}", tofile=f"b/{name}")) or "(no changes)"
+
+def workspace() -> str | None:
+    parts = []
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        root   = subprocess.check_output(['git','rev-parse','--show-toplevel'], stderr=subprocess.DEVNULL, text=True).strip()
+        branch = subprocess.check_output(['git','branch','--show-current'], stderr=subprocess.DEVNULL, text=True).strip()
+        parts.append(f"git:{Path(root).name}@{branch}")
+    except Exception: pass
+    venv = os.environ.get('VIRTUAL_ENV') or os.environ.get('CONDA_DEFAULT_ENV')
+    if venv: parts.append(f"env:{Path(venv).name}")
+    return ' · '.join(parts) if parts else None
 
-def kill_active_shell(ident):
-    proc = ACTIVE_SHELLS.get(ident)
-    if proc and proc.poll() is None:
-        _kill_proc(proc)
+def backup(p: Path) -> Path:
+    bak = BACKUP_DIR / f"{p.name}_{int(time.time())}.bak"
+    try: shutil.copy2(p, bak)
+    except Exception: pass
+    return bak
+
+# ── Danger detection ────────────────────────────────────────────────────
+_DANGER_RE = [
+    r'\brm\s+(-[rRf]{1,3}|--recursive|--force)\s*/\S*',
+    r'\bdd\b.*\bof=/dev/', r'\bmkfs\b', r'>\s*/dev/sd[a-z]',
+    r':\(\)\s*\{.*\}', r'\bsudo\s+(rm|dd|mkfs)',
+    r'curl[^|#\n]*\|\s*(ba)?sh', r'wget[^|#\n]*\|\s*(ba)?sh',
+    r'\bshred\b', r'\bwipefs\b', r'nc\s+.*-[eEcC]',
+    r'base64\s+-d\s*\|', r'python[23]?\s+-c\s+[\'"].*(?:import\s+os|subprocess)',
+]
+_danger_ok: set[str] = set()
+
+def is_dangerous(cmd: str) -> bool:
+    h = hashlib.sha1(cmd.encode()).hexdigest()
+    if h in _danger_ok: return False
+    return any(re.search(p, cmd, re.I) for p in _DANGER_RE)
+
+def danger_confirm(label: str, detail: str = "") -> bool:
+    print(); rule("─", C.RED)
+    print(f"  {c(C.RED+C.B,'⚠  DANGEROUS')}  {c(C.GRAY, label)}")
+    if detail:
+        for ln in textwrap.wrap(detail[:300], 70): print(f"  {c(C.GRAY, ln)}")
+    rule("─", C.RED)
+    ans = input(f"  {c(C.RED+C.B,'Type YES to allow, ALWAYS to always allow:')} ").strip()
+    if ans == "ALWAYS":
+        _danger_ok.add(hashlib.sha1(detail.encode()).hexdigest())
         return True
-    return False
+    return ans == "YES"
 
-def _strip_tags(s):
-    return htmlmod.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s))).strip()
+# ── Spinner ─────────────────────────────────────────────────────────────
+class Spinner:
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    MSGS = {
+        "thinking":  ["thinking…","reasoning…","planning…"],
+        "running":   ["running…","executing…"],
+        "searching": ["searching…","fetching…"],
+        "testing":   ["testing…","verifying…"],
+        "coding":    ["coding…","drafting…"],
+        "compress":  ["compressing…"],
+    }
+    def __init__(self, kind="thinking"):
+        self.msgs  = self.MSGS.get(kind, self.MSGS["thinking"])
+        self._stop = threading.Event()
+        self._t    = threading.Thread(target=self._spin, daemon=True)
 
-def _fetch(url, data=None, timeout=10):
-    """GET/POST with realistic headers; retries once with relaxed SSL on cert errors."""
-    req = urllib.request.Request(url, data=data, headers={
-        **UA, "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
-        **({"Content-Type": "application/x-www-form-urlencoded"} if data else {})})
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            msg = self.msgs[(i // 10) % len(self.msgs)]
+            sys.stdout.write(f"\r  {c(C.CYAN, self.FRAMES[i%10])} {c(C.GRAY, msg)}   ")
+            sys.stdout.flush(); time.sleep(0.09); i += 1
+
+    def start(self): self._t.start(); return self
+
+    def stop(self):
+        self._stop.set(); self._t.join(0.3)
+        sys.stdout.write(f"\r{' '*50}\r"); sys.stdout.flush()
+
+# ── Output helpers ──────────────────────────────────────────────────────
+def ok(m):   print(f"  {c(C.GREEN,'✓')}  {m}")
+def warn(m): print(f"  {c(C.YEL,'⚠')}  {m}")
+def err(m):  print(f"  {c(C.RED,'✗')}  {m}")
+def info(m): print(f"  {c(C.BLUE,'·')}  {c(C.GRAY, m)}")
+
+def tool_hdr(icon: str, tag: str, detail: str = ""):
+    print(f"\n  {c(C.MAG,icon)} {c(C.GRAY+C.DIM,tag+':')} {c(C.WHT, detail[:80]+('…' if len(detail)>80 else ''))}")
+
+def result_box(text: str, success: bool = True, max_lines: int = 35):
+    col = C.DGRN if success else C.RED
+    lines = text.splitlines()
+    for ln in lines[:max_lines]:
+        print(f"  {c(col,'│')} {c(C.GRAY, ln)}")
+    if len(lines) > max_lines:
+        print(f"  {c(col,'│')} {c(C.DGRAY, f'  … +{len(lines)-max_lines} lines')}")
+
+def diff_box(text: str, max_lines: int = 50):
+    print()
+    for ln in text.splitlines()[:max_lines]:
+        if ln.startswith('+') and not ln.startswith('+++'):   print(f"  {c(C.DGRN, ln)}")
+        elif ln.startswith('-') and not ln.startswith('---'): print(f"  {c(C.RED,  ln)}")
+        elif ln.startswith('@@'):                             print(f"  {c(C.CYAN, ln)}")
+        else:                                                 print(f"  {c(C.GRAY, ln)}")
+
+# ── Context compression ─────────────────────────────────────────────────
+def compress_history(msgs: list[dict]) -> list[dict]:
+    if len(msgs) <= CTX_COMPRESS_AT: return msgs
+    sys_msgs   = [m for m in msgs if m['role'] == 'system']
+    non_sys    = [m for m in msgs if m['role'] != 'system']
+    if len(non_sys) <= CTX_KEEP_RECENT + 2: return msgs
+    to_squash  = non_sys[:-CTX_KEEP_RECENT]
+    keep       = non_sys[-CTX_KEEP_RECENT:]
+    spin = Spinner("compress").start()
     try:
-        return urllib.request.urlopen(req, timeout=timeout).read().decode("utf-8", "replace")
-    except urllib.error.URLError as e:
-        if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            return urllib.request.urlopen(req, timeout=timeout, context=ctx).read().decode("utf-8", "replace")
-        raise
-
-def _ddg_url(href):
-    if href.startswith("//"):
-        href = "https:" + href
-    q = urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get("uddg")
-    return urllib.parse.unquote(q[0]) if q else href
-
-def _dedupe(pairs, n=6):
-    out, seen = [], set()
-    for url, title in pairs:
-        if not url.startswith("http") or url in seen:
-            continue
-        seen.add(url)
-        out.append(f"- {_strip_tags(title)}\n  {url}")
-        if len(out) >= n:
-            break
-    return out
-
-def t_search(a):
-    query, errs = a["query"], []
-    # 1) DuckDuckGo Lite
-    try:
-        page = _fetch("https://lite.duckduckgo.com/lite/",
-                      data=urllib.parse.urlencode({"q": query}).encode())
-        hits = re.findall(r'<a[^>]+href="([^"]+)"[^>]*class="result-link"[^>]*>(.*?)</a>', page, re.S) \
-            or re.findall(r'<a rel="nofollow" href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
-        out = _dedupe((_ddg_url(h), t) for h, t in hits)
-        if out:
-            return "\n".join(out)
-        errs.append("ddg-lite: parsed 0 results (likely bot challenge)")
+        blob = "\n".join(
+            f"[{m['role'].upper()}]: {str(m['content'])[:300]}" for m in to_squash)
+        payload = {
+            "model": cfg["model"], "stream": False,
+            "messages": [
+                {"role":"system","content":"Summarise this conversation excerpt. Keep: file paths, decisions, errors, outcomes. Be concise."},
+                {"role":"user","content": blob[:5000]},
+            ],
+            "options": {"temperature": 0.1, "num_ctx": 8192},
+        }
+        resp    = requests.post(CHAT_URL, json=payload, timeout=60)
+        summary = resp.json().get("message",{}).get("content","").strip()
     except Exception as e:
-        errs.append(f"ddg-lite: {type(e).__name__}: {e}")
-    # 2) DuckDuckGo HTML
+        spin.stop(); warn(f"Compress failed: {e}"); return msgs
+    finally: spin.stop()
+    new = sys_msgs + [{"role":"user","content":f"[HISTORY SUMMARY]\n{summary}\n[/HISTORY]"}] + keep
+    info(f"History compressed: {len(msgs)} → {len(new)} msgs")
+    return new
+
+
+def build_system_prompt() -> str:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    ws  = workspace()
+    mem = load_memory()
+    mem_str  = " | ".join(f"{k}={v}" for k, v in list(mem.items())[:5]) or "(empty)"
+    note_str = " | ".join(n['text'][:40] for n in _notes[-2:]) or "(none)"
+
+    tools = (
+        # FS
+        "<read>path</read>  <write file='path'>text</write>  <append file='path'>text</append>\n"
+        "<patch file='path'><<<FIND\nold\n>>>REPLACE\nnew\n>>>END</patch>\n"
+        "<delete file=p/>  <edit file=p pattern=re>repl</edit>\n"
+        "<listdir>p</listdir>  <tree>p</tree>  <find>name||dir</find>  <glob>pat</glob>\n"
+        "<grep>pat||file_or_dir</grep>  <cd>p</cd>  <mkdir>p</mkdir>\n"
+        "<move src=a dest=b/>  <copy src=a dest=b/>  <zip src=p dest=z/>  <unzip src=z dest=p/>\n"
+        "<diff file1=a file2=b/>  <summarize>p</summarize>  <stat>p</stat>  <wc>p</wc>\n"
+        "<head n=20>p</head>  <tail n=20>p</tail>  <touch>p</touch>  <chmod>mode p</chmod>\n"
+        # Exec
+        "<execute>cmd</execute>  <pyeval>code</pyeval>  <test>file_or_cmd</test>  <which>prog</which>\n"
+        # Web
+        "<search>query</search>  <http url=URL/>  <http method=POST url=URL>body</http>\n"
+        # Memory
+        "<remember key=k>v</remember>  <forget key=k/>  <note>text</note>  <notes/>\n"
+        # Util
+        "<calc>expr</calc>  <env>VAR</env>  <uuid/>  <ts/>  <hash algo=sha256>text</hash>\n"
+        "<b64>text</b64>  <unb64>text</unb64>  <urlencode>t</urlencode>  <urldecode>t</urldecode>\n"
+        # JSON/CSV
+        "<jsonq>expr||file</jsonq>  <csvhead>file</csvhead>  <csvq>col=val||file</csvq>\n"
+        "<template file=p>vars_json</template>  <replace_all file=p>old|||new</replace_all>\n"
+        # Code tools
+        "<lint>file</lint>  <fmt>file</fmt>  <complexity>file</complexity>\n"
+        "<imports>file</imports>  <tokcount>file</tokcount>  <todos>dir</todos>\n"
+        "<pip>pkg</pip>  <pytest>path</pytest>  <black>file</black>\n"
+        # Git
+        "<git>args</git>  <git_log>n</git_log>  <git_diff/>  <git_status/>  <git_blame>f</git_blame>\n"
+        # System
+        "<ps/>  <df/>  <free/>  <du>path</du>  <uname/>  <kill>pid</kill>\n"
+        # Fun
+        "<weather>city</weather>  <define>word</define>  <translate lang=es>text</translate>\n"
+        "<joke/>  <quote/>  <clip>text</clip>  <open>path_or_url</open>\n"
+    )
+
+    return (
+        f"Your ARIA (Build 6) — a sharp, autonomous AI agent. "
+        f"Solve tasks completely. Think step by step. Use tools strategically.\n\n"
+        f"STATE: time={now}  cwd={os.getcwd()}  ws={ws or 'none'}\n"
+        f"FLAGS: shell={'ON' if cfg['allow_shell'] else 'OFF'}  "
+        f"net={'ON' if cfg['allow_network'] else 'OFF'}  "
+        f"write={'ON' if cfg['allow_write'] else 'OFF'}\n"
+        f"MEMORY: {mem_str}\nNOTES: {note_str}\n\n"
+        f"TOOLS:\n{tools}\n"
+        f"RULES:\n"
+        f"1. ONE tool tag per reply — wait for result before using another.\n"
+        f"2. EXACT syntax: <write file='name.ext'>content</write> — file= not path=, no semicolons, no extra attributes.\n"
+        f"3. Always READ a file before patching it.\n"
+        f"4. Prefer <patch> over full rewrites. Never rewrite a file that already exists unless architecture is broken.\n"
+        f"5. On failure: read the exact error, diagnose, targeted fix only.\n"
+        f"6. When done, say DONE and give a clear summary.\n"
+        f"7. Be concise. No markdown tables in plans — just act."
+    )
+
+def code_agent_prompt(task: str, code_mem: dict) -> str:
+    """Prompt tuned for 9b models: explicit, structured, memory-aware."""
+    # Inject relevant past sessions
+    past = ""
+    sessions = code_mem.get("sessions", [])[-5:]
+    if sessions:
+        past = "PAST SESSIONS (learn from these):\n"
+        for s in sessions:
+            past += f"  [{s['time'][:10]}] {s['task'][:80]} → {s['outcome'][:100]}\n"
+        past += "\n"
+
+    patterns = code_mem.get("known_patterns", {})
+    pat_str = ""
+    if patterns:
+        pat_str = "KNOWN PATTERNS:\n"
+        for k, v in list(patterns.items())[-3:]:
+            pat_str += f"  {k}: files={v['files']}\n"
+        pat_str += "\n"
+
+    return (
+        f"Your ARIA Code Agent. You write and fix code. You are methodical.\n\n"
+        f"{past}{pat_str}"
+        f"TASK: {task}\n\n"
+        f"WORKFLOW (follow this exactly):\n"
+        f"STEP 1 — PLAN: List files to create/modify. State approach.\n"
+        f"STEP 2 — BUILD: Write files using <write> or <patch> tools.\n"
+        f"STEP 3 — TEST: Run with <test> or <execute>. Read ALL output.\n"
+        f"STEP 4 — FIX: If failing, read the error, patch ONLY broken parts.\n"
+        f"STEP 5 — REPEAT steps 3-4 until tests pass (max {CODE_MAX_ITER} tries).\n"
+        f"STEP 6 — REPORT: State what was built, how to run it, any caveats.\n\n"
+        f"ONE tool per message. Do not skip steps. Begin with STEP 1."
+    )
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TOOL IMPLEMENTATIONS
+# ═══════════════════════════════════════════════════════════════════════
+
+# ── File I/O ─────────────────────────────────────────────────────────────
+_CODE_EXTS = {'.py','.js','.ts','.c','.cpp','.h','.rs','.go','.java',
+              '.sh','.yaml','.json','.toml','.html','.css','.jsx','.tsx',
+              '.vue','.rb','.php','.swift','.kt','.md','.sql','.xml'}
+
+def tool_read(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    if p.is_dir():     return f"Is a directory — use <listdir>", False
     try:
-        page = _fetch("https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query))
-        hits = re.findall(r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', page, re.S)
-        out = _dedupe((_ddg_url(h), t) for h, t in hits)
-        if out:
-            return "\n".join(out)
-        errs.append("ddg-html: parsed 0 results")
-    except Exception as e:
-        errs.append(f"ddg-html: {type(e).__name__}: {e}")
-    # 3) Bing
+        content = p.read_text(encoding='utf-8', errors='replace')
+        if p.suffix.lower() in _CODE_EXTS:
+            lines = content.splitlines()
+            numbered = "\n".join(f"{i:>4} │ {l}" for i, l in enumerate(lines, 1))
+            return f"[{path}] ({len(lines)} lines)\n{trunc(numbered)}", True
+        return f"[{path}]\n{trunc(content)}", True
+    except Exception as e: return f"Read error: {e}", False
+
+def tool_write(path: str, content: str) -> tuple[str, bool]:
+    if not cfg["allow_write"]: return "Write disabled", False
+    p = Path(path).expanduser()
     try:
-        page = _fetch("https://www.bing.com/search?q=" + urllib.parse.quote_plus(query))
-        hits = re.findall(r'<h2><a href="(http[^"]+)"[^>]*>(.*?)</a></h2>', page, re.S)
-        out = _dedupe(hits)
-        if out:
-            return "\n".join(out)
-        errs.append("bing: parsed 0 results")
-    except Exception as e:
-        errs.append(f"bing: {type(e).__name__}: {e}")
-    return ("ERROR: all search engines failed:\n" + "\n".join("  " + e for e in errs)
-            + "\nTell the user search failed and show these reasons; do not invent results.")
+        bak = f"\n  backup: {backup(p).name}" if p.exists() else ""
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding='utf-8')
+        return f"Wrote {len(content):,} chars / {content.count(chr(10))+1} lines → {path}{bak}", True
+    except Exception as e: return f"Write failed: {e}", False
 
-def t_browse(a):
-    page = _fetch(a["url"], timeout=12)
-    page = re.sub(r"(?is)<(script|style|nav|footer|header)[^>]*>.*?</\1>", " ", page)
-    text = _strip_tags(page)
-    return text[:6000] + ("…[truncated]" if len(text) > 6000 else "")
+def tool_append(path: str, content: str) -> tuple[str, bool]:
+    if not cfg["allow_write"]: return "Write disabled", False
+    try:
+        p = Path(path).expanduser(); p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open('a', encoding='utf-8') as f:
+            f.write(content if content.endswith('\n') else content + '\n')
+        return f"Appended {len(content):,} chars to {path}", True
+    except Exception as e: return f"Append failed: {e}", False
 
-TOOLS = {"read_file": t_read_file, "write_file": t_write_file, "edit_file": t_edit_file,
-         "shell": t_shell, "search": t_search, "browse": t_browse}
-CONFIRM = {"shell": "confirmShell", "write_file": "confirmWrite", "edit_file": "confirmWrite"}
+def tool_delete(path: str) -> tuple[str, bool]:
+    if not cfg["allow_write"]: return "Write disabled", False
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        bak = backup(p); p.unlink()
+        return f"Deleted {path}  (backup: {bak.name})", True
+    except Exception as e: return f"Delete failed: {e}", False
 
-def tool_detail(n, a):
-    return {"read_file": a.get("path", ""), "write_file": a.get("path", ""),
-            "edit_file": a.get("path", ""), "shell": "$ " + a.get("command", ""),
-            "search": '"%s"' % a.get("query", ""), "browse": a.get("url", "")}.get(n, "")
+def tool_patch(path: str, body: str) -> tuple[str, bool]:
+    if not cfg["allow_write"]: return "Write disabled", False
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path} — use <write> to create it first", False
+    try: original = p.read_text(encoding='utf-8')
+    except Exception as e: return f"Read error: {e}", False
 
-def partial_detail(name, text):
-    pats = {"read_file": r'"path"\s*:\s*"([^"]*)', "edit_file": r'"path"\s*:\s*"([^"]*)',
-            "shell": r'"command"\s*:\s*"([^"]*)', "search": r'"query"\s*:\s*"([^"]*)',
-            "browse": r'"url"\s*:\s*"([^"]*)'}
-    m = re.search(pats.get(name, r"$^"), text)
-    d = m.group(1) if m else ""
-    return ("$ " + d) if name == "shell" else d
+    hunks = re.findall(r'<<<FIND\s*\n(.*?)>>>REPLACE\s*\n(.*?)>>>END', body, re.DOTALL)
+    if not hunks:
+        return ("Patch parse error. Required format:\n"
+                "<<<FIND\nold text\n>>>REPLACE\nnew text\n>>>END"), False
 
-# ── tool-call extraction ───────────────────────────────────────────
-WRITE_RE = re.compile(r"<<write:([^\n>]+)>>\r?\n?")
-
-def extract_tool(text):
-    if '"tool"' not in text:
-        return None, -1, -1
-    for m in re.finditer(r"\{", text):
-        s = m.start()
-        depth, instr, escp = 0, False, False
-        for i in range(s, len(text)):
-            ch = text[i]
-            if instr:
-                if escp: escp = False
-                elif ch == "\\": escp = True
-                elif ch == '"': instr = False
-            elif ch == '"': instr = True
-            elif ch == "{": depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    chunk = text[s:i + 1]
-                    if '"tool"' in chunk:
-                        try:
-                            obj = json.loads(chunk)
-                            if isinstance(obj, dict) and "tool" in obj:
-                                return obj, s, i + 1
-                        except ValueError:
-                            pass
-                    break
-    return None, -1, -1
-
-# ── LLM streaming ──────────────────────────────────────────────────
-def llm_stream(cfg, messages):
-    base = cfg["baseUrl"].rstrip("/")
-    if cfg["platform"] == "ollama":
-        url = base + "/api/chat"
-        body = {"model": cfg["model"], "messages": messages, "stream": True,
-                "options": {"temperature": cfg.get("temp", 0.7)}}
-    else:
-        if not base.endswith("/v1"): base += "/v1"
-        url = base + "/chat/completions"
-        body = {"model": cfg["model"], "messages": messages, "stream": True,
-                "temperature": cfg.get("temp", 0.7)}
-    req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=300) as resp:
-        for raw in resp:
-            line = raw.decode("utf-8", "replace").strip()
-            if line.startswith("data:"): line = line[5:].strip()
-            if not line or line == "[DONE]": continue
-            try: j = json.loads(line)
-            except ValueError: continue
-            tok = (j.get("message", {}) or {}).get("content", "") if cfg["platform"] == "ollama" \
-                else ((j.get("choices") or [{}])[0].get("delta", {}) or {}).get("content", "")
-            if tok: yield tok
-
-# ── agent loop ─────────────────────────────────────────────────────
-TRAIL = re.compile(r"(```json|```html|```|<<tool>>|\s)+$")
-
-def run_agent(cfg, history, emit):
-    sysp = cfg.get("sysPrompt", "Your Aria (Autonomous Reasoning Intelligent Agent), a local AI agent.")
-    if cfg.get("deepResearch"):
-        sysp += " Deep-research mode: plan multi-step search/browse investigations, verify claims, give a structured report."
-    messages = [{"role": "system", "content": sysp + "\n\n" + TOOL_SPEC}] + history
-    bad = 0
-
-    for _ in range(MAX_TURNS):
-        full, emitted, call = "", 0, None
-        gen_id, gen_name, gen_from, gen_mark = None, None, 0, 0
-
-        for tok in llm_stream(cfg, messages):
-            full += tok
-            cands = []
-            jt = full.find('"tool"')
-            if jt != -1:
-                b = full.rfind("{", 0, jt)
-                cands.append(b if b != -1 else jt)
-            mt = full.find("<<tool")
-            if mt != -1: cands.append(mt)
-            wt = full.find("<<write:")
-            if wt != -1: cands.append(wt)
-            limit = min(cands) if cands else len(full) - 12
-            if limit > emitted:
-                emit({"type": "token", "text": full[emitted:limit]}); emitted = limit
-
-            if cands and gen_id is None:
-                gen_id, gen_from, gen_mark = uuid.uuid4().hex[:8], min(cands), len(full)
-            if gen_id:
-                if gen_name is None:
-                    wm = WRITE_RE.search(full)
-                    if wt != -1 and wm and wm.start() == wt:
-                        gen_name = "write_file"
-                        emit({"type": "tool", "id": gen_id, "tool": "write_file",
-                              "detail": wm.group(1).strip(), "status": "gen"})
-                    else:
-                        nm = re.search(r'"tool"\s*:\s*"(\w+)"', full)
-                        if nm:
-                            gen_name = nm.group(1)
-                            emit({"type": "tool", "id": gen_id, "tool": gen_name,
-                                  "detail": partial_detail(gen_name, full), "status": "gen"})
-                elif len(full) - gen_mark > 350:
-                    gen_mark = len(full)
-                    emit({"type": "tool_progress", "id": gen_id, "size": len(full) - gen_from})
-
-            wm = WRITE_RE.search(full)
-            if wm:
-                e = full.find("<<end>>", wm.end())
-                if e != -1:
-                    call = ("write", wm, full[wm.end():e].rstrip("\n")); break
-            if '"tool"' in full:
-                obj, s, _ = extract_tool(full)
-                if obj:
-                    call = ("json", obj, s); break
-
-        if call is None:
-            wm = WRITE_RE.search(full)
-            if wm and len(full) > wm.end():
-                call = ("write", wm, full[wm.end():].rstrip("\n"))
-
-        if call is None:
-            if '"tool"' in full or "<<tool" in full or "<<write:" in full:
-                if gen_id:
-                    emit({"type": "tool_end", "id": gen_id, "ok": False, "output": "malformed tool call"})
-                bad += 1
-                if bad > 2:
-                    emit({"type": "token", "text": "\n\n⚠️ The model kept producing malformed tool calls. Try a larger / more instruction-tuned model."})
-                    emit({"type": "done"}); return
-                messages += [{"role": "assistant", "content": full},
-                             {"role": "user", "content": 'Your tool call was malformed. Use the <<write:path>> block for files, or ONLY valid JSON like {"tool":"shell","args":{"command":"ls"}}.'}]
-                continue
-            if len(full) > emitted:
-                emit({"type": "token", "text": full[emitted:]})
-            emit({"type": "done"}); return
-
-        if call[0] == "write":
-            name, args, s = "write_file", {"path": call[1].group(1).strip(), "content": call[2]}, call[1].start()
+    content, applied, report = original, 0, []
+    for find_raw, repl_raw in hunks:
+        find = find_raw.rstrip('\n')
+        repl = repl_raw.rstrip('\n')
+        if find in content:
+            content = content.replace(find, repl, 1); applied += 1
+            report.append(f"✓ ({len(find.splitlines())}→{len(repl.splitlines())} lines)")
         else:
-            _, obj, s = call
-            name, args = obj.get("tool"), obj.get("args", {}) or {}
-        pre = TRAIL.sub("", full[:s])
-        if len(pre) > emitted:
-            emit({"type": "token", "text": pre[emitted:]})
-        cid = gen_id or uuid.uuid4().hex[:8]
-        detail = tool_detail(name, args)
-
-        if name not in TOOLS:
-            result = f"ERROR: unknown tool '{name}'. Valid: {', '.join(TOOLS)}"
-            emit({"type": "tool", "id": cid, "tool": name or "?", "detail": detail, "status": "run"})
-        else:
-            flag = CONFIRM.get(name)
-            if flag and cfg.get(flag, True):
-                emit({"type": "tool", "id": cid, "tool": name, "detail": detail, "status": "confirm"})
-                ev = threading.Event(); PENDING[cid] = {"ev": ev, "approved": None, "always": False}
-                ev.wait(300)
-                entry = PENDING.pop(cid, {})
-                if not entry.get("approved"):
-                    emit({"type": "tool_end", "id": cid, "ok": False, "output": "Denied by user"})
-                    messages += [{"role": "assistant", "content": full},
-                                 {"role": "user", "content": f"Tool result for {name}:\nUser DENIED this action. Do not retry it. Adjust or explain."}]
-                    continue
-                if entry.get("always"):
-                    emit({"type": "always_allow", "flag": flag})
-                emit({"type": "tool", "id": cid, "tool": name, "detail": detail, "status": "run"})
+            # Whitespace-normalised fallback
+            sc = "\n".join(l.rstrip() for l in content.splitlines())
+            sf = "\n".join(l.rstrip() for l in find.splitlines())
+            if sf in sc:
+                content = sc.replace(sf, repl, 1); applied += 1
+                report.append(f"✓ (whitespace-normalised)")
             else:
-                emit({"type": "tool", "id": cid, "tool": name, "detail": detail, "status": "run"})
-            try:
-                result = TOOLS[name](args)
-            except KeyError as e:
-                result = f"ERROR: missing arg {e}"
-            except Exception as e:
-                result = f"ERROR: {e}"
+                report.append(f"✗ NOT FOUND: {repr(find[:60])}")
 
-        emit({"type": "tool_end", "id": cid, "ok": not str(result).startswith("ERROR"),
-              "output": str(result)[:2500]})
-        messages += [{"role": "assistant", "content": full},
-                     {"role": "user", "content": f"Tool result for {name}:\n{result}\n\nContinue: call another tool if needed, otherwise give the final answer in plain language (no JSON, no blocks)."}]
+    if not applied: return "No hunks applied — check that FIND text matches exactly.", False
+    bak = backup(p)
+    try: p.write_text(content, encoding='utf-8')
+    except Exception as e: return f"Write error: {e}", False
+    diff = udiff(original, content, p.name)
+    return (f"Patched {path} [{applied}/{len(hunks)} hunks]  bak:{bak.name}\n"
+            + " | ".join(report) + "\n\n" + diff), True
 
-    emit({"type": "token", "text": "\n\n⚠️ Reached the tool-call limit for one message."})
-    emit({"type": "done"})
+def tool_edit(path: str, pattern: str, replacement: str) -> tuple[str, bool]:
+    if not cfg["allow_write"]: return "Write disabled", False
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        orig = p.read_text(encoding='utf-8')
+        new, n = re.subn(pattern, replacement, orig)
+        if not n: return f"Pattern not found: {pattern}", False
+        backup(p); p.write_text(new, encoding='utf-8')
+        return f"Replaced {n} occurrence(s)\n{udiff(orig, new, p.name)}", True
+    except re.error as e: return f"Regex error: {e}", False
+    except Exception as e: return f"Edit failed: {e}", False
 
-# ── HTTP server ────────────────────────────────────────────────────
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
+# ── Navigation ────────────────────────────────────────────────────────
+def tool_cd(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser().resolve()
+    if not p.is_dir(): return f"Not a directory: {path}", False
+    try: os.chdir(p); return f"Now in {p}", True
+    except Exception as e: return f"cd failed: {e}", False
 
-    def _json(self, obj, code=200):
-        b = json.dumps(obj).encode()
-        self.send_response(code); self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+def tool_listdir(path: str) -> tuple[str, bool]:
+    p = Path(path or ".").expanduser().resolve()
+    if not p.is_dir(): return f"Not a directory: {path}", False
+    try:
+        items = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        lines = []
+        for item in items[:150]:
+            if item.is_file():
+                sz = item.stat().st_size
+                lines.append(f"  📄 {item.name}  {c(C.DGRAY, f'{sz//1024}KB' if sz>=1024 else f'{sz}B')}")
+            else:
+                lines.append(f"  📁 {c(C.CYAN, item.name)}/")
+        if len(items) > 150: lines.append(f"  … +{len(items)-150} more")
+        return "\n".join(lines) or "(empty)", True
+    except Exception as e: return f"listdir error: {e}", False
 
-    def _fetch_json(self, url, timeout=6):
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Aria/1.0", "Accept": "application/json"})
+def tool_tree(path: str, depth: int = 3) -> tuple[str, bool]:
+    p = Path(path or ".").expanduser().resolve()
+    if not p.is_dir(): return f"Not a directory: {path}", False
+    lines = [f"{c(C.CYAN, p.name)}/"]
+    def _walk(d: Path, prefix: str, level: int):
+        if level > depth: return
+        try: items = sorted(d.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except PermissionError: return
+        for i, item in enumerate(items[:50]):
+            conn = "└── " if i == len(items)-1 else "├── "
+            ext  = "    " if i == len(items)-1 else "│   "
+            if item.is_dir():
+                lines.append(f"{prefix}{conn}{c(C.CYAN, item.name)}/")
+                _walk(item, prefix+ext, level+1)
+            else:
+                lines.append(f"{prefix}{conn}{item.name}")
+    _walk(p, "", 1)
+    return "\n".join(lines[:200]), True
+
+def tool_glob(pattern: str) -> tuple[str, bool]:
+    try:
+        results = sorted(Path.cwd().glob(pattern))[:200]
+        return ("\n".join(str(r) for r in results) if results else "No matches"), bool(results)
+    except Exception as e: return f"Glob error: {e}", False
+
+def tool_grep(args: str) -> tuple[str, bool]:
+    sep = '||'
+    if sep in args: pattern, target = args.split(sep, 1)
+    else:
+        parts = args.strip().split(maxsplit=1)
+        if len(parts) < 2: return "Usage: <grep>pattern||file_or_dir</grep>", False
+        pattern, target = parts
+    pattern, target = pattern.strip(), target.strip()
+    tp = Path(target).expanduser()
+    if tp.is_file():   files = [tp]
+    elif tp.is_dir():  files = [f for f in tp.rglob('*') if f.is_file() and f.stat().st_size < 1_000_000][:80]
+    else: return f"Not found: {target}", False
+    try: rx = re.compile(pattern, re.I)
+    except re.error as e: return f"Regex error: {e}", False
+    results, total = [], 0
+    for fp in files:
         try:
-            return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
-        except urllib.error.URLError as e:
-            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
-                ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                return json.loads(urllib.request.urlopen(req, timeout=timeout, context=ctx).read())
-            raise
+            for i, line in enumerate(fp.read_text(errors='replace').splitlines(), 1):
+                if rx.search(line):
+                    rel = str(fp.relative_to(Path.cwd()) if fp.is_absolute() else fp)
+                    results.append(f"{c(C.CYAN,rel)}:{c(C.YEL,str(i))}  {line.strip()[:160]}")
+                    total += 1
+                    if total >= 60: break
+        except Exception: pass
+        if total >= 60: break
+    return ("\n".join(results) if results else "No matches"), bool(results)
 
-    def _waiting_page(self, ip):
-        b = WAIT_HTML.replace("__IP__", ip).encode()
-        self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+def tool_find(args: str) -> tuple[str, bool]:
+    if '||' in args: pat, d = args.split('||', 1)
+    else:
+        parts = args.strip().split(maxsplit=1)
+        pat = parts[0]; d = parts[1] if len(parts) > 1 else "."
+    try:
+        rx   = re.compile(pat.strip(), re.I)
+        hits = [str(p) for p in Path(d.strip()).expanduser().rglob('*') if rx.search(p.name)][:100]
+        return ("\n".join(hits) if hits else "No matches"), bool(hits)
+    except Exception as e: return f"Find error: {e}", False
 
-    # -- access gate, applied to every request --
-    def _gate(self, ip):
-        """Returns True if allowed to proceed. Handles the response itself if not."""
-        state = access_check(ip)
-        if state == "ok":
-            return True
-        if self.path == "/":
-            if state == "new":
-                access_register_pending(ip, self.headers.get("User-Agent", "?"))
-            self._waiting_page(ip)
-            return False
-        # API calls from unapproved devices
-        if state == "new":
-            access_register_pending(ip, self.headers.get("User-Agent", "?"))
-        self._json({"ok": False, "pending": True,
-                     "error": "Waiting for the host device to approve this device."}, 403)
-        return False
+def tool_mkdir(path: str) -> tuple[str, bool]:
+    try: Path(path).expanduser().mkdir(parents=True, exist_ok=True); return f"Created {path}", True
+    except Exception as e: return f"mkdir failed: {e}", False
 
-    def do_GET(self):
-        ip = self.client_address[0]
-        p = urllib.parse.urlparse(self.path)
+def tool_move(src: str, dst: str) -> tuple[str, bool]:
+    s, d = Path(src).expanduser(), Path(dst).expanduser()
+    if not s.exists(): return f"Not found: {src}", False
+    try: d.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(s), str(d)); return f"Moved {src} → {dst}", True
+    except Exception as e: return f"Move failed: {e}", False
 
-        # Access-status endpoints must work even for unapproved devices
-        if p.path == "/api/access/status":
-            state = access_check(ip)
-            self._json({"state": state, "isHost": ip == ACCESS["host"]})
-            return
-        if p.path == "/api/access/pending":
-            if ip != ACCESS["host"]:
-                self._json({"pending": []}); return
-            with ACCESS_LOCK:
-                lst = [{"ip": k, **v} for k, v in ACCESS["pending"].items()]
-            self._json({"pending": lst, "trusted": sorted(ACCESS["trusted"])})
-            return
+def tool_copy(src: str, dst: str) -> tuple[str, bool]:
+    s, d = Path(src).expanduser(), Path(dst).expanduser()
+    if not s.exists(): return f"Not found: {src}", False
+    try:
+        d.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(s), str(d), dirs_exist_ok=True) if s.is_dir() else shutil.copy2(s, d)
+        return f"Copied {src} → {dst}", True
+    except Exception as e: return f"Copy failed: {e}", False
 
-        if not self._gate(ip):
-            return
+def tool_zip(src: str, dest: str) -> tuple[str, bool]:
+    sp, dp = Path(src).expanduser(), Path(dest).expanduser()
+    if not sp.exists(): return f"Not found: {src}", False
+    try:
+        with zipfile.ZipFile(dp, 'w', zipfile.ZIP_DEFLATED) as zf:
+            if sp.is_dir():
+                for f in sp.rglob('*'):
+                    if f.is_file(): zf.write(f, f.relative_to(sp.parent))
+            else: zf.write(sp, sp.name)
+        return f"Created {dest} ({dp.stat().st_size:,} bytes)", True
+    except Exception as e: return f"Zip failed: {e}", False
 
-        if p.path == "/":
-            b = HTML.encode()
-            self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
-        elif p.path == "/api/models":
-            q = urllib.parse.parse_qs(p.query)
-            plat, url = q.get("platform", [""])[0], q.get("url", [""])[0].rstrip("/")
-            try:
-                if plat == "ollama":
-                    r = self._fetch_json(url + "/api/tags")
-                    models = [m["name"] for m in r.get("models", [])]
-                else:
-                    if not url.endswith("/v1"): url += "/v1"
-                    r = self._fetch_json(url + "/models")
-                    models = [m["id"] for m in r.get("data", [])]
-                self._json({"ok": True, "models": models, "cwd": ROOT})
-            except (subprocess.TimeoutExpired, urllib.error.URLError) as e:
-                err = str(e)
-                if "timed out" in err.lower():
-                    self._json({"ok": False, "error": "Connection timed out — is your runtime running?", "cwd": ROOT})
-                elif "Connection refused" in err:
-                    self._json({"ok": False, "error": "Connection refused — start your runtime and check the endpoint URL", "cwd": ROOT})
-                else:
-                    self._json({"ok": False, "error": err, "cwd": ROOT})
-            except Exception as e:
-                self._json({"ok": False, "error": str(e), "cwd": ROOT})
+def tool_unzip(src: str, dest: str) -> tuple[str, bool]:
+    sp, dp = Path(src).expanduser(), Path(dest).expanduser()
+    if not sp.exists(): return f"Not found: {src}", False
+    try:
+        dp.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(sp) as zf:
+            zf.extractall(dp); n = len(zf.namelist())
+        return f"Extracted {src} → {dest} ({n} files)", True
+    except Exception as e: return f"Unzip failed: {e}", False
+
+def tool_diff(f1: str, f2: str) -> tuple[str, bool]:
+    p1, p2 = Path(f1).expanduser(), Path(f2).expanduser()
+    if not p1.exists(): return f"Not found: {f1}", False
+    if not p2.exists(): return f"Not found: {f2}", False
+    try:
+        t1 = p1.read_text(errors='replace'); t2 = p2.read_text(errors='replace')
+        d = udiff(t1, t2, f1)
+        return (d if d != "(no changes)" else "Files are identical."), True
+    except Exception as e: return f"Diff failed: {e}", False
+
+def tool_summarize(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    if p.is_dir():
+        fs = list(p.rglob('*'))
+        total = sum(f.stat().st_size for f in fs if f.is_file())
+        return (f"Dir: {p.name}  files={sum(1 for f in fs if f.is_file())}  "
+                f"dirs={sum(1 for f in fs if f.is_dir())}  size={total:,}B"), True
+    try:
+        text  = p.read_text(errors='replace'); lines = text.splitlines()
+        words = sum(len(l.split()) for l in lines)
+        preview = "\nFirst 10 lines:\n" + "\n".join(lines[:10])
+        return f"File: {p.name}  ({p.stat().st_size:,}B  {len(lines):,} lines  {words:,} words){preview}", True
+    except Exception as e: return str(e), False
+
+# ── Execution ──────────────────────────────────────────────────────────
+def tool_execute(cmd: str) -> tuple[str, bool]:
+    if not cfg["allow_shell"]:
+        return "Shell disabled. Enable with: /allow shell on", False
+    if not cmd.strip(): return "Empty command", False
+    if is_dangerous(cmd):
+        if not (cfg["danger_confirm"] and danger_confirm("Shell command", cmd)):
+            return "Blocked: dangerous pattern.", False
+    spin = Spinner("running").start()
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                             timeout=90, cwd=os.getcwd())
+        spin.stop()
+        out   = (res.stdout + res.stderr).strip() or "(no output)"
+        label = c(C.GREEN if res.returncode==0 else C.RED, f"exit {res.returncode}")
+        return f"{label}\n{trunc(out)}", res.returncode == 0
+    except subprocess.TimeoutExpired: spin.stop(); return "Timed out (90s)", False
+    except Exception as e: spin.stop(); return f"Execute failed: {e}", False
+
+def tool_pyeval(code: str) -> tuple[str, bool]:
+    global _pystate
+    blocked = {'__import__', 'subprocess', 'os.system', '__builtins__', 'compile('}
+    for tok in blocked:
+        if tok in code: return f"Blocked: '{tok}' not allowed in pyeval", False
+    old_out, old_err = sys.stdout, sys.stderr
+    cap_out, cap_err = io.StringIO(), io.StringIO()
+    try:
+        sys.stdout, sys.stderr = cap_out, cap_err
+        exec(compile(code, "<pyeval>", "exec"), _pystate)
+        out = cap_out.getvalue(); err_s = cap_err.getvalue()
+        result = out + (f"\n[stderr]:\n{err_s}" if err_s else "")
+        return trunc(result.strip()) or "(no output)", True
+    except Exception as e:
+        return f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}", False
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+
+def tool_test(target: str) -> tuple[str, bool]:
+    target = target.strip()
+    if not target: return "No target", False
+    p = Path(target)
+    spin = Spinner("testing").start()
+    try:
+        if p.suffix == '.py' and p.exists():
+            cmd = [sys.executable, str(p)]; is_list = True
         else:
-            self.send_error(404)
+            cmd = target; is_list = False
+        res = subprocess.run(cmd if is_list else cmd, shell=not is_list,
+                             capture_output=True, text=True,
+                             timeout=SANDBOX_TIMEOUT, cwd=os.getcwd())
+        spin.stop()
+        passed = res.returncode == 0
+        out    = (res.stdout + res.stderr).strip() or "(no output)"
+        label  = c(C.GREEN if passed else C.RED, "PASS" if passed else "FAIL")
+        return f"exit {res.returncode} — {label}\n{trunc(out)}", passed
+    except subprocess.TimeoutExpired: spin.stop(); return f"Timed out ({SANDBOX_TIMEOUT}s)", False
+    except Exception as e: spin.stop(); return f"Test error: {e}", False
 
-    def do_POST(self):
-        ip = self.client_address[0]
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        raw = self.rfile.read(length) if length else b"{}"
+def tool_which(prog: str) -> tuple[str, bool]:
+    p = shutil.which(prog.strip())
+    return (f"{prog} → {p}", True) if p else (f"{prog}: not found", False)
 
-        if self.path == "/api/access/respond":
-            if ip != ACCESS["host"]:
-                self._json({"ok": False, "error": "Only the host device can manage access."}, 403)
-                return
-            data = json.loads(raw or b"{}")
-            target, approve = data.get("ip"), bool(data.get("approve"))
-            with ACCESS_LOCK:
-                ACCESS["pending"].pop(target, None)
-                if approve:
-                    ACCESS["trusted"].add(target)
-                else:
-                    ACCESS["trusted"].discard(target)
-            self._json({"ok": True})
-            return
+def tool_calc(expr: str) -> tuple[str, bool]:
+    import math
+    try:
+        result = eval(re.sub(r'[^0-9+\-*/().%, a-zA-Z_]', '', expr),
+                      {"__builtins__": {}}, vars(math))
+        return str(result), True
+    except Exception as e: return f"Calc error: {e}", False
 
-        if not self._gate(ip):
-            return
+def tool_env(var: str) -> tuple[str, bool]:
+    val = os.environ.get(var.strip())
+    return (f"{var}={val}", True) if val is not None else (f"{var} is not set", False)
 
-        data = json.loads(raw or b"{}")
-        if self.path == "/api/approve":
-            e = PENDING.get(data.get("id"))
-            if e:
-                e["approved"] = bool(data.get("approved"))
-                e["always"] = bool(data.get("always"))
-                e["ev"].set()
-            self._json({"ok": True})
-        elif self.path == "/api/stop":
-            killed = False
-            for ident, proc in list(ACTIVE_SHELLS.items()):
-                if proc.poll() is None:
-                    _kill_proc(proc); killed = True
-            self._json({"ok": True, "killed": killed})
-        elif self.path == "/api/chat":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache"); self.end_headers()
-            def emit(o):
-                self.wfile.write(f"data: {json.dumps(o)}\n\n".encode()); self.wfile.flush()
+# ── Web ────────────────────────────────────────────────────────────────
+def tool_search(query: str) -> tuple[str, bool]:
+    if not cfg["allow_network"]: return "Network disabled", False
+    import urllib.parse, html as _html
+    try:
+        hdrs = {"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) Chrome/124"}
+        resp = requests.post("https://html.duckduckgo.com/html/",
+                             data={"q": query}, headers=hdrs, timeout=12)
+        resp.raise_for_status()
+        results = []
+        for m in re.finditer(r'<a class="result__url" href="([^"]+)"[^>]*>(.*?)</a>',
+                             resp.text, re.I | re.S):
+            link  = m.group(1)
+            title = _html.unescape(re.sub(r'<[^>]+>', '', m.group(2))).strip()
+            if 'uddg=' in link:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse("http:"+link).query)
+                link = qs.get('uddg', [link])[0]
+            results.append(f"• {title}\n  {link}")
+            if len(results) >= cfg.get("search_n", 5): break
+        return "\n\n".join(results) or "No results.", bool(results)
+    except Exception as e: return f"Search error: {e}", False
+
+def tool_http(url: str, method: str = "GET", body: str = "") -> tuple[str, bool]:
+    if not cfg["allow_network"]: return "Network disabled", False
+    try:
+        hdrs = {"User-Agent": "ARIA/6.0"}
+        resp = (requests.post(url, data=body, headers=hdrs, timeout=20)
+                if method.upper() == "POST"
+                else requests.get(url, headers=hdrs, timeout=20))
+        resp.raise_for_status()
+        ct = resp.headers.get('content-type', '')
+        out = json.dumps(resp.json(), indent=2) if 'json' in ct else resp.text
+        return f"HTTP {resp.status_code}\n{trunc(out, 8000)}", True
+    except Exception as e: return f"HTTP error: {e}", False
+
+# ── Memory & Notes ─────────────────────────────────────────────────────
+def tool_remember(key: str, val: str) -> tuple[str, bool]:
+    mem = load_memory(); mem[key] = val; save_memory(mem)
+    return f"Remembered: {key} = {val}", True
+
+def tool_forget(key: str) -> tuple[str, bool]:
+    mem = load_memory()
+    if key not in mem: return f"Key not found: {key}", False
+    del mem[key]; save_memory(mem); return f"Forgotten: {key}", True
+
+def tool_note(text: str) -> tuple[str, bool]:
+    _notes.append({"text": text, "time": datetime.datetime.now().isoformat(timespec='seconds')})
+    save_notes(); return f"Note saved: {text}", True
+
+def tool_notes_list() -> tuple[str, bool]:
+    if not _notes: return "No notes.", True
+    return "\n".join(f"{n['time']}  {n['text']}" for n in _notes[-20:]), True
+
+# ── Text utils ─────────────────────────────────────────────────────────
+def _file_text(p: Path) -> tuple[str, bool]:
+    if not p.exists(): return f"Not found: {p}", False
+    try: return p.read_text(errors='replace'), True
+    except Exception as e: return str(e), False
+
+def tool_wc(path: str) -> tuple[str, bool]:
+    t, ok_f = _file_text(Path(path).expanduser())
+    if not ok_f: return t, False
+    return f"lines={t.count(chr(10))}  words={len(t.split())}  chars={len(t)}  file={path}", True
+
+def tool_head(path: str, n: int = 20) -> tuple[str, bool]:
+    t, ok_f = _file_text(Path(path).expanduser())
+    return ("\n".join(t.splitlines()[:n]), True) if ok_f else (t, False)
+
+def tool_tail(path: str, n: int = 20) -> tuple[str, bool]:
+    t, ok_f = _file_text(Path(path).expanduser())
+    return ("\n".join(t.splitlines()[-n:]), True) if ok_f else (t, False)
+
+def tool_touch(path: str) -> tuple[str, bool]:
+    try: p = Path(path).expanduser(); p.parent.mkdir(parents=True, exist_ok=True); p.touch(); return f"Touched {p}", True
+    except Exception as e: return str(e), False
+
+def tool_stat(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    s = p.stat()
+    mt = datetime.datetime.fromtimestamp(s.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+    return (f"path={p}  size={s.st_size:,}B  modified={mt}  "
+            f"mode={oct(s.st_mode)[-3:]}  type={'dir' if p.is_dir() else 'file'}"), True
+
+def tool_chmod(args: str) -> tuple[str, bool]:
+    parts = args.strip().split(maxsplit=1)
+    if len(parts) < 2: return "Usage: <chmod>mode path</chmod>", False
+    try: Path(parts[1]).expanduser().chmod(int(parts[0], 8)); return f"chmod {args}", True
+    except Exception as e: return str(e), False
+
+def tool_replace_all(path: str, args: str) -> tuple[str, bool]:
+    if '|||' not in args: return "Usage: <replace_all file=p>old|||new</replace_all>", False
+    old, new = args.split('|||', 1)
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        orig = p.read_text(encoding='utf-8'); n = orig.count(old)
+        if not n: return f"'{old}' not found", False
+        backup(p); p.write_text(orig.replace(old, new), encoding='utf-8')
+        return f"Replaced {n} occurrence(s)", True
+    except Exception as e: return str(e), False
+
+def tool_template(path: str, vars_json: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        text = p.read_text(encoding='utf-8'); vals = json.loads(vars_json)
+        for k, v in vals.items(): text = text.replace(f"{{{{{k}}}}}", str(v))
+        return text, True
+    except Exception as e: return str(e), False
+
+# ── JSON / CSV ─────────────────────────────────────────────────────────
+def tool_jsonq(args: str) -> tuple[str, bool]:
+    if '||' not in args: return "Usage: <jsonq>expr||file</jsonq>", False
+    expr, fpath = args.split('||', 1)
+    p = Path(fpath.strip()).expanduser()
+    if not p.exists(): return f"Not found: {fpath}", False
+    try:
+        data = json.loads(p.read_text(encoding='utf-8'))
+        for part in re.split(r'\.(?![^[]*\])', expr.strip().lstrip('.')):
+            if not part: continue
+            m = re.match(r'^(\w+)?\[(\d+)\]$', part)
+            if m:
+                if m.group(1): data = data[m.group(1)]
+                data = data[int(m.group(2))]
+            else: data = data[part]
+        return (json.dumps(data, indent=2) if not isinstance(data, str) else data), True
+    except Exception as e: return f"jsonq error: {e}", False
+
+def tool_csvhead(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        import csv
+        with p.open(newline='', encoding='utf-8', errors='replace') as f:
+            rows = list(csv.reader(f))[:5]
+        if not rows: return "(empty)", True
+        widths = [max(len(str(c)) for c in col) for col in zip(*rows)]
+        return '\n'.join('  '.join(str(c).ljust(w) for c,w in zip(r,widths)) for r in rows), True
+    except Exception as e: return str(e), False
+
+def tool_csvq(args: str) -> tuple[str, bool]:
+    if '||' not in args: return "Usage: <csvq>col=val||file</csvq>", False
+    expr, fpath = args.split('||', 1)
+    p = Path(fpath.strip()).expanduser()
+    if not p.exists(): return f"Not found: {fpath}", False
+    try:
+        import csv
+        with p.open(newline='', encoding='utf-8', errors='replace') as f:
+            rows = list(csv.DictReader(f))
+        if '=' in expr:
+            col, val = expr.split('=', 1)
+            rows = [r for r in rows if r.get(col.strip(),'').lower() == val.strip().lower()]
+        return f"{len(rows)} rows\n" + '\n'.join(json.dumps(r) for r in rows[:50]), bool(rows)
+    except Exception as e: return str(e), False
+
+# ── Git ────────────────────────────────────────────────────────────────
+def _git(args: str) -> tuple[str, bool]:
+    if not cfg["allow_shell"]: return "Shell disabled", False
+    try:
+        res = subprocess.run(f"git {args}", shell=True, capture_output=True,
+                             text=True, timeout=30, cwd=os.getcwd())
+        return trunc((res.stdout + res.stderr).strip() or "(no output)"), res.returncode == 0
+    except Exception as e: return str(e), False
+
+def tool_git(args: str)     -> tuple[str, bool]: return _git(args)
+def tool_git_log(n: str)    -> tuple[str, bool]: return _git(f"log --oneline -{n or 10}")
+def tool_git_diff()         -> tuple[str, bool]: return _git("diff")
+def tool_git_status()       -> tuple[str, bool]: return _git("status -s")
+def tool_git_blame(f: str)  -> tuple[str, bool]: return _git(f"blame {f}")
+
+# ── System ─────────────────────────────────────────────────────────────
+def _ro(cmd: str) -> tuple[str, bool]:
+    try:
+        res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return (res.stdout + res.stderr).strip() or "(no output)", res.returncode == 0
+    except Exception as e: return str(e), False
+
+def tool_ps()             -> tuple[str, bool]: return _ro("ps aux | head -25")
+def tool_df()             -> tuple[str, bool]: return _ro("df -h")
+def tool_free()           -> tuple[str, bool]: return _ro("free -h")
+def tool_du(path: str)    -> tuple[str, bool]: return _ro(f"du -sh {path}/*")
+def tool_uname()          -> tuple[str, bool]: return _ro("uname -a")
+def tool_kill(pid: str)   -> tuple[str, bool]:
+    if not cfg["allow_shell"]: return "Shell disabled", False
+    try: os.kill(int(pid), 15); return f"SIGTERM → {pid}", True
+    except Exception as e: return str(e), False
+
+# ── Network ────────────────────────────────────────────────────────────
+def tool_ping(host: str)   -> tuple[str, bool]: return _ro(f"ping -c 3 -W 2 {host.strip()}")
+def tool_dns(host: str)    -> tuple[str, bool]: return _ro(f"nslookup {host.strip()}")
+def tool_whois(d: str)     -> tuple[str, bool]: return _ro(f"whois {d.strip()} 2>/dev/null | head -25")
+
+# ── Python dev ─────────────────────────────────────────────────────────
+def tool_pip(args: str) -> tuple[str, bool]:
+    if not cfg["allow_shell"]: return "Shell disabled", False
+    try:
+        res = subprocess.run([sys.executable, "-m", "pip"] + args.split(),
+                             capture_output=True, text=True, timeout=120)
+        return (res.stdout + res.stderr).strip(), res.returncode == 0
+    except Exception as e: return str(e), False
+
+def tool_pytest(path: str) -> tuple[str, bool]:
+    if not cfg["allow_shell"]: return "Shell disabled", False
+    res = subprocess.run([sys.executable, "-m", "pytest", path.strip(), "-v", "--tb=short"],
+                         capture_output=True, text=True, timeout=60, cwd=os.getcwd())
+    return trunc((res.stdout + res.stderr).strip()), res.returncode == 0
+
+def tool_black(path: str) -> tuple[str, bool]:
+    res = subprocess.run([sys.executable, "-m", "black", path.strip()],
+                         capture_output=True, text=True, timeout=30)
+    return (res.stdout + res.stderr).strip(), res.returncode == 0
+
+def tool_lint(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    for linter in ["flake8", "pylint", "pyflakes"]:
+        if shutil.which(linter):
+            res = subprocess.run([linter, str(p)], capture_output=True, text=True, timeout=30)
+            return (res.stdout + res.stderr).strip() or "No issues.", res.returncode == 0
+    try: ast.parse(p.read_text(encoding='utf-8')); return "Syntax OK (no linter installed)", True
+    except SyntaxError as e: return f"SyntaxError: {e}", False
+
+def tool_complexity(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        tree = ast.parse(p.read_text(encoding='utf-8'))
+        scores = sorted(
+            [(n.name, sum(1 for x in ast.walk(n)
+                          if isinstance(x, (ast.If, ast.For, ast.While, ast.ExceptHandler, ast.With))) + 1)
+             for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))],
+            key=lambda x: -x[1])
+        return "Cyclomatic complexity:\n" + "\n".join(f"  {n}: {s}" for n, s in scores[:20]), True
+    except Exception as e: return str(e), False
+
+def tool_imports(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        tree = ast.parse(p.read_text(encoding='utf-8'))
+        imps = []
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Import):           imps += [a.name for a in n.names]
+            elif isinstance(n, ast.ImportFrom):     imps.append(f"from {n.module}")
+        return "\n".join(sorted(set(imps))) or "(none)", True
+    except Exception as e: return str(e), False
+
+def tool_tokcount(path: str) -> tuple[str, bool]:
+    p = Path(path).expanduser()
+    if not p.exists(): return f"Not found: {path}", False
+    try:
+        text = p.read_text(errors='replace')
+        return f"~{len(text)//4:,} tokens  ({len(text):,} chars)", True
+    except Exception as e: return str(e), False
+
+def tool_todos(dirpath: str) -> tuple[str, bool]:
+    return tool_grep(f"TODO|FIXME|HACK||{dirpath}")
+
+# ── Hashing / encoding ─────────────────────────────────────────────────
+def tool_hash(text: str, algo: str = "sha256") -> tuple[str, bool]:
+    h = hashlib.new(algo, text.encode(errors='replace'))
+    return f"{algo}: {h.hexdigest()}", True
+
+def tool_b64(text: str) -> tuple[str, bool]:
+    import base64; return base64.b64encode(text.encode()).decode(), True
+
+def tool_unb64(text: str) -> tuple[str, bool]:
+    import base64
+    try: return base64.b64decode(text.strip()).decode(errors='replace'), True
+    except Exception as e: return str(e), False
+
+def tool_urlencode(text: str) -> tuple[str, bool]:
+    import urllib.parse; return urllib.parse.quote_plus(text), True
+
+def tool_urldecode(text: str) -> tuple[str, bool]:
+    import urllib.parse; return urllib.parse.unquote_plus(text), True
+
+def tool_uuid() -> tuple[str, bool]:
+    import uuid; return str(uuid.uuid4()), True
+
+def tool_ts() -> tuple[str, bool]:
+    now = datetime.datetime.now()
+    return f"local={now.strftime('%Y-%m-%d %H:%M:%S')}  unix={int(now.timestamp())}  iso={now.isoformat()}", True
+
+# ── Fun ────────────────────────────────────────────────────────────────
+_JOKES = [
+    "Why do programmers prefer dark mode? Light attracts bugs. 🐛",
+    "A SQL query walks into a bar, walks up to two tables and asks 'Can I join you?'",
+    "Why do Java devs wear glasses? Because they don't C#.",
+    "There are 10 types of people: those who understand binary, and those who don't.",
+    "Debugging: being the detective in a crime movie where you're also the murderer.",
+]
+_QUOTES = [
+    '"Any fool can write code a computer understands. Good programmers write code humans understand." — Fowler',
+    '"First, solve the problem. Then, write the code." — Johnson',
+    '"Talk is cheap. Show me the code." — Torvalds',
+    '"Make it work, make it right, make it fast." — Beck',
+]
+
+def tool_joke()  -> tuple[str, bool]: import random; return random.choice(_JOKES), True
+def tool_quote() -> tuple[str, bool]: import random; return random.choice(_QUOTES), True
+
+def tool_weather(city: str) -> tuple[str, bool]:
+    if not cfg["allow_network"]: return "Network disabled", False
+    try:
+        resp = requests.get(f"https://wttr.in/{city.strip()}?format=3",
+                            timeout=8, headers={"User-Agent": "curl"})
+        return resp.text.strip(), resp.ok
+    except Exception as e: return str(e), False
+
+def tool_define(word: str) -> tuple[str, bool]:
+    if not cfg["allow_network"]: return "Network disabled", False
+    try:
+        resp = requests.get(f"https://api.dictionaryapi.dev/api/v2/entries/en/{word.strip()}", timeout=8)
+        data = resp.json()
+        if isinstance(data, list) and data:
+            lines = []
+            for m in data[0].get("meanings", [])[:2]:
+                for d in m.get("definitions", [])[:1]:
+                    lines.append(f"[{m.get('partOfSpeech','')}] {d.get('definition','')}")
+            return "\n".join(lines) or "No definition found.", bool(lines)
+        return str(data), False
+    except Exception as e: return str(e), False
+
+def tool_translate(text: str, lang: str = "es") -> tuple[str, bool]:
+    if not cfg["allow_network"]: return "Network disabled", False
+    try:
+        import urllib.parse
+        url = (f"https://translate.googleapis.com/translate_a/single?"
+               f"client=gtx&sl=auto&tl={lang}&dt=t&q={urllib.parse.quote(text)}")
+        data = requests.get(url, timeout=10).json()
+        return "".join(p[0] for p in data[0] if p[0]), True
+    except Exception as e: return f"Translate error: {e}", False
+
+def tool_clip(text: str) -> tuple[str, bool]:
+    for cmd in [["xclip","-selection","clipboard"],["xsel","--clipboard","--input"],["pbcopy"],["clip.exe"]]:
+        if shutil.which(cmd[0]):
+            try: subprocess.run(cmd, input=text.encode(), timeout=5); return f"Copied {len(text)} chars", True
+            except Exception: pass
+    return "No clipboard tool found", False
+
+def tool_open(target: str) -> tuple[str, bool]:
+    for opener in ["xdg-open","open","start"]:
+        if shutil.which(opener):
+            try: subprocess.Popen([opener, target.strip()], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); return f"Opening {target}", True
+            except Exception as e: return str(e), False
+    return "No opener found", False
+
+# ── Plugins ────────────────────────────────────────────────────────────
+_plugins: dict[str, Any] = {}
+
+def load_plugins():
+    for fp in PLUGINS_DIR.glob("*.py"):
+        try:
+            ns: dict = {}
+            exec(fp.read_text(encoding='utf-8'), ns)
+            _plugins[fp.stem] = ns; info(f"Plugin: {fp.stem}")
+        except Exception as e: warn(f"Plugin {fp.name}: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════
+#  TOOL DISPATCHER
+# ═══════════════════════════════════════════════════════════════════════
+
+def dispatch(tag: str, fn, icon: str, detail: str, *args, **kwargs) -> tuple[bool, str, str]:
+    global _last_tool_result
+    tool_hdr(icon, tag, detail)
+    result, success = fn(*args, **kwargs)
+    _tool_counts[tag] += 1; _last_tool_result = result
+    result_box(result, success)
+    return True, result, tag
+
+def process_tools(text: str) -> tuple[bool, str, str]:
+    """Find and execute first tool tag. Returns (used, result, tag_name)."""
+
+    # Structural tools (need special handling)
+    m = re.search(r'<patch\s+(?:file|path)=["\']([^"\']+)["\'][^>]*>(.*?)</patch>', text, re.S|re.I)
+    if m:
+        fp, body = m.group(1).strip(), m.group(2)
+        tool_hdr("🩹", "patch", fp)
+        result, success = tool_patch(fp, body)
+        _tool_counts["patch"] += 1; _last_tool_result = result
+        result_box(result, success)
+        if success and cfg["show_diffs"]:
+            diff_lines = [l for l in result.splitlines() if l.startswith(('+','-','@@','---','+++'))]
+            if diff_lines: diff_box("\n".join(diff_lines[:50]))
+        return True, result, "patch"
+
+    # write — accept file= or path= attribute
+    m = re.search(r'<write\s+(?:file|path)=["\']([^"\']+)["\'][^>]*>(.*?)</write>', text, re.S|re.I)
+    if not m:
+        m2 = re.search(r'<write\s+([^>]+)>(.*?)</write>', text, re.S|re.I)
+        if m2:
+            fp_m = re.search(r'(?:file|path)=["\']?([^\s"\'>;&]+)', m2.group(1))
+            if fp_m:
+                return dispatch("write", tool_write, "💾", fp_m.group(1), fp_m.group(1).strip(), m2.group(2))
+    if m: return dispatch("write", tool_write, "💾", m.group(1), m.group(1).strip(), m.group(2))
+
+    # append — accept file= or path= attribute
+    m = re.search(r'<append\s+(?:file|path)=["\']([^"\']+)["\'][^>]*>(.*?)</append>', text, re.S|re.I)
+    if not m:
+        m2 = re.search(r'<append\s+([^>]+)>(.*?)</append>', text, re.S|re.I)
+        if m2:
+            fp_m = re.search(r'(?:file|path)=["\']?([^\s"\'>;&]+)', m2.group(1))
+            if fp_m:
+                return dispatch("append", tool_append, "➕", fp_m.group(1), fp_m.group(1).strip(), m2.group(2))
+    if m: return dispatch("append", tool_append, "➕", m.group(1), m.group(1).strip(), m.group(2))
+
+    m = re.search(r'<delete\s+(?:file=["\']([^"\']+)["\'][^>]*/?|([^>]*))>', text, re.I)
+    if not m: m = re.search(r'<delete>(.*?)</delete>', text, re.S|re.I)
+    if m:
+        fp = (m.group(1) or m.group(2) or "").strip()
+        return dispatch("delete", tool_delete, "🗑", fp, fp)
+
+    m = re.search(r'<diff\s+file1=["\']([^"\']+)["\']\s+file2=["\']([^"\']+)["\'][^>]*/?>',text,re.I)
+    if m:
+        f1, f2 = m.group(1), m.group(2)
+        tool_hdr("🔀","diff",f"{f1} ↔ {f2}")
+        result, success = tool_diff(f1, f2)
+        _tool_counts["diff"] += 1; _last_tool_result = result
+        result_box(result, success)
+        if success: diff_box(result)
+        return True, result, "diff"
+
+    for tag, fn, icon in [("move", tool_move, "📦"), ("copy", tool_copy, "📋")]:
+        m = re.search(rf'<{tag}\s+([^>]+)/>', text, re.I)
+        if m:
+            a = m.group(1)
+            src = re.search(r'src=["\']([^"\']+)["\']', a)
+            dst = re.search(r'dest=["\']([^"\']+)["\']', a)
+            if src and dst: return dispatch(tag, fn, icon, f"{src.group(1)}→{dst.group(1)}", src.group(1), dst.group(1))
+
+    m = re.search(r'<zip\s+src=["\']([^"\']+)["\']\s+dest=["\']([^"\']+)["\'][^>]*/?>',text,re.I)
+    if m: return dispatch("zip", tool_zip, "📦", m.group(1), m.group(1), m.group(2))
+
+    m = re.search(r'<unzip\s+src=["\']([^"\']+)["\']\s+dest=["\']([^"\']+)["\'][^>]*/?>',text,re.I)
+    if m: return dispatch("unzip", tool_unzip, "📤", m.group(1), m.group(1), m.group(2))
+
+    m = re.search(r'<remember\s+key=["\']([^"\']+)["\'][^>]*>(.*?)</remember>',text,re.S|re.I)
+    if m: return dispatch("remember", tool_remember, "🧠", m.group(1), m.group(1).strip(), m.group(2).strip())
+
+    m = re.search(r'<forget\s+key=["\']([^"\']+)["\'][^>]*/?>',text,re.I)
+    if m: return dispatch("forget", tool_forget, "🗑", m.group(1), m.group(1).strip())
+
+    m = re.search(r'<edit\s+file=["\']([^"\']+)["\']\s+pattern=["\']([^"\']+)["\'][^>]*>(.*?)</edit>',text,re.S|re.I)
+    if m: return dispatch("edit", tool_edit, "✏️", m.group(1), m.group(1), m.group(2), m.group(3))
+
+    m = re.search(r'<http\s+method=["\'](\w+)["\'][^>]*url=["\']([^"\']+)["\'][^>]*>(.*?)</http>',text,re.S|re.I)
+    if m: return dispatch("http", tool_http, "🌐", f"{m.group(1)} {m.group(2)}", m.group(2), m.group(1), m.group(3))
+
+    m = re.search(r'<http\s+url=["\']?([^"\'>\s]+)["\']?\s*/?>', text, re.I)
+    if not m: m = re.search(r'<http>(.*?)</http>', text, re.S|re.I)
+    if m: return dispatch("http", tool_http, "🌐", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<hash\s+algo=["\']([^"\']+)["\'][^>]*>(.*?)</hash>',text,re.S|re.I)
+    if m: return dispatch("hash", tool_hash, "🔑", f"{m.group(1)}", m.group(2).strip(), m.group(1))
+
+    m = re.search(r'<head\s+n=(\d+)>(.*?)</head>',text,re.S|re.I)
+    if m: return dispatch("head", tool_head, "📄", m.group(2), m.group(2).strip(), int(m.group(1)))
+
+    m = re.search(r'<tail\s+n=(\d+)>(.*?)</tail>',text,re.S|re.I)
+    if m: return dispatch("tail", tool_tail, "📄", m.group(2), m.group(2).strip(), int(m.group(1)))
+
+    m = re.search(r'<replace_all\s+file=["\']([^"\']+)["\'][^>]*>(.*?)</replace_all>',text,re.S|re.I)
+    if m: return dispatch("replace_all", tool_replace_all, "🔄", m.group(1), m.group(1), m.group(2))
+
+    m = re.search(r'<template\s+file=["\']([^"\']+)["\'][^>]*>(.*?)</template>',text,re.S|re.I)
+    if m: return dispatch("template", tool_template, "📝", m.group(1), m.group(1), m.group(2).strip())
+
+    m = re.search(r'<translate\s+lang=["\']([^"\']+)["\'][^>]*>(.*?)</translate>',text,re.S|re.I)
+    if m: return dispatch("translate", tool_translate, "🌍", m.group(2)[:30], m.group(2).strip(), m.group(1))
+
+    m = re.search(r'<cd>(.*?)</cd>',text,re.S|re.I)
+    if m: return dispatch("cd", tool_cd, "📂", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<mkdir>(.*?)</mkdir>',text,re.S|re.I)
+    if m: return dispatch("mkdir", tool_mkdir, "📁", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<chmod>(.*?)</chmod>',text,re.S|re.I)
+    if m: return dispatch("chmod", tool_chmod, "🔒", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<calc>(.*?)</calc>',text,re.S|re.I)
+    if m: return dispatch("calc", tool_calc, "🔢", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<env>(.*?)</env>',text,re.S|re.I)
+    if m: return dispatch("env", tool_env, "🌍", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<note>(.*?)</note>',text,re.S|re.I)
+    if m: return dispatch("note", tool_note, "📝", m.group(1).strip()[:60], m.group(1).strip())
+
+    m = re.search(r'<notes\s*/>',text,re.I)
+    if m: return dispatch("notes", tool_notes_list, "📝", "list")
+
+    m = re.search(r'<git_log>(.*?)</git_log>',text,re.S|re.I)
+    if m: return dispatch("git_log", tool_git_log, "📜", m.group(1).strip(), m.group(1).strip())
+
+    m = re.search(r'<git_diff\s*/>',text,re.I)
+    if m: return dispatch("git_diff", tool_git_diff, "🔀", "diff")
+
+    m = re.search(r'<git_status\s*/>',text,re.I)
+    if m: return dispatch("git_status", tool_git_status, "📊", "status")
+
+    m = re.search(r'<git_blame>(.*?)</git_blame>',text,re.S|re.I)
+    if m: return dispatch("git_blame", tool_git_blame, "📜", m.group(1), m.group(1).strip())
+
+    m = re.search(r'<dps\s*/>',text,re.I)
+    if m: return dispatch("dps", lambda: _ro("docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'"), "🐳", "docker ps")
+
+    m = re.search(r'<ps\s*/>',text,re.I)
+    if m: return dispatch("ps", tool_ps, "⚙️", "process list")
+
+    m = re.search(r'<df\s*/>',text,re.I)
+    if m: return dispatch("df", tool_df, "💿", "disk free")
+
+    m = re.search(r'<free\s*/>',text,re.I)
+    if m: return dispatch("free", tool_free, "💾", "memory free")
+
+    m = re.search(r'<uname\s*/>',text,re.I)
+    if m: return dispatch("uname", tool_uname, "🖥️", "uname")
+
+    m = re.search(r'<uuid\s*/>',text,re.I)
+    if m: return dispatch("uuid", tool_uuid, "🆔", "generate uuid")
+
+    m = re.search(r'<ts\s*/>',text,re.I)
+    if m: return dispatch("ts", tool_ts, "🕐", "timestamp")
+
+    m = re.search(r'<joke\s*/>',text,re.I)
+    if m: return dispatch("joke", tool_joke, "😄", "random joke")
+
+    m = re.search(r'<quote\s*/>',text,re.I)
+    if m: return dispatch("quote", tool_quote, "💬", "random quote")
+
+    # Simple single-arg tools
+    SIMPLE = [
+        ("execute",    tool_execute,    r'<execute>(.*?)</execute>',    "⚡"),
+        ("pyeval",     tool_pyeval,     r'<pyeval>(.*?)</pyeval>',      "🐍"),
+        ("read",       tool_read,       r'<read>(.*?)</read>',          "📖"),
+        ("test",       tool_test,       r'<test>(.*?)</test>',          "🧪"),
+        ("which",      tool_which,      r'<which>(.*?)</which>',        "🔍"),
+        ("summarize",  tool_summarize,  r'<summarize>(.*?)</summarize>',"📋"),
+        ("search",     tool_search,     r'<search>(.*?)</search>',      "🔍"),
+        ("listdir",    tool_listdir,    r'<listdir>(.*?)</listdir>',    "📁"),
+        ("tree",       tool_tree,       r'<tree>(.*?)</tree>',          "🌲"),
+        ("find",       tool_find,       r'<find>(.*?)</find>',          "🔎"),
+        ("glob",       tool_glob,       r'<glob>(.*?)</glob>',          "🔎"),
+        ("grep",       tool_grep,       r'<grep>(.*?)</grep>',          "🔬"),
+        ("stat",       tool_stat,       r'<stat>(.*?)</stat>',          "ℹ️"),
+        ("wc",         tool_wc,         r'<wc>(.*?)</wc>',              "📊"),
+        ("head",       tool_head,       r'<head>(.*?)</head>',          "📄"),
+        ("tail",       tool_tail,       r'<tail>(.*?)</tail>',          "📄"),
+        ("touch",      tool_touch,      r'<touch>(.*?)</touch>',        "✨"),
+        ("jsonq",      tool_jsonq,      r'<jsonq>(.*?)</jsonq>',        "{}"),
+        ("csvhead",    tool_csvhead,    r'<csvhead>(.*?)</csvhead>',    "📊"),
+        ("csvq",       tool_csvq,       r'<csvq>(.*?)</csvq>',          "📊"),
+        ("git",        tool_git,        r'<git>(.*?)</git>',            "🔧"),
+        ("du",         tool_du,         r'<du>(.*?)</du>',              "💿"),
+        ("kill",       tool_kill,       r'<kill>(.*?)</kill>',          "🔴"),
+        ("pip",        tool_pip,        r'<pip>(.*?)</pip>',            "📦"),
+        ("pytest",     tool_pytest,     r'<pytest>(.*?)</pytest>',      "🧪"),
+        ("black",      tool_black,      r'<black>(.*?)</black>',        "⬛"),
+        ("lint",       tool_lint,       r'<lint>(.*?)</lint>',          "🔍"),
+        ("fmt",        tool_black,      r'<fmt>(.*?)</fmt>',            "✨"),
+        ("complexity", tool_complexity, r'<complexity>(.*?)</complexity>',"📊"),
+        ("imports",    tool_imports,    r'<imports>(.*?)</imports>',    "📦"),
+        ("tokcount",   tool_tokcount,   r'<tokcount>(.*?)</tokcount>',  "🔢"),
+        ("todos",      tool_todos,      r'<todos>(.*?)</todos>',        "📝"),
+        ("ping",       tool_ping,       r'<ping>(.*?)</ping>',          "🌐"),
+        ("dns",        tool_dns,        r'<dns>(.*?)</dns>',            "🌐"),
+        ("whois",      tool_whois,      r'<whois>(.*?)</whois>',        "🌐"),
+        ("weather",    tool_weather,    r'<weather>(.*?)</weather>',    "🌤"),
+        ("define",     tool_define,     r'<define>(.*?)</define>',      "📚"),
+        ("b64",        tool_b64,        r'<b64>(.*?)</b64>',            "🔤"),
+        ("unb64",      tool_unb64,      r'<unb64>(.*?)</unb64>',        "🔤"),
+        ("urlencode",  tool_urlencode,  r'<urlencode>(.*?)</urlencode>',"🔗"),
+        ("urldecode",  tool_urldecode,  r'<urldecode>(.*?)</urldecode>',"🔗"),
+        ("clip",       tool_clip,       r'<clip>(.*?)</clip>',          "📋"),
+        ("open",       tool_open,       r'<open>(.*?)</open>',          "🔗"),
+    ]
+    for tag, fn, pat, icon in SIMPLE:
+        m = re.search(pat, text, re.S|re.I)
+        if m: return dispatch(tag, fn, icon, m.group(1).strip()[:80], m.group(1).strip())
+
+    return False, "", ""
+
+# ═══════════════════════════════════════════════════════════════════════
+#  INFERENCE
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_inference(messages: list[dict], override_sys: str = "") -> str | None:
+    global _msg_count, _token_total
+
+    if cfg.get("auto_compress") and len(messages) > CTX_COMPRESS_AT:
+        messages[:] = compress_history(messages)
+
+    payload: dict = {
+        "model": cfg["model"],
+        "messages": messages,
+        "stream":   cfg["stream"],
+        "options": {
+            "temperature": cfg["temperature"],
+            "num_ctx":     cfg["ctx"],
+            "top_p":       cfg["top_p"],
+        },
+    }
+    if cfg["max_tokens"] > 0:
+        payload["options"]["num_predict"] = cfg["max_tokens"]
+
+    try:
+        CRASH_FILE.write_text(json.dumps({"messages": messages[-8:], "cfg": cfg}, indent=2))
+    except Exception: pass
+
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            fallback = cfg.get("fallback_model", "")
+            if fallback and attempt == 1:
+                warn(f"Retrying with fallback: {fallback}")
+                payload["model"] = fallback
+            else:
+                time.sleep(1.5 * attempt)
+
+        if cfg["stream"]:
+            print(f"\n  {c(C.CYAN+C.B,'◈ ARIA')}: ", end="", flush=True)
+            full = ""; t0 = time.time()
             try:
-                run_agent(data["cfg"], data["messages"], emit)
-            except (BrokenPipeError, ConnectionError):
-                kill_active_shell(threading.get_ident())
+                resp = requests.post(CHAT_URL, json=payload, stream=True, timeout=240)
+                resp.raise_for_status()
+                for line in resp.iter_lines():
+                    if not line: continue
+                    data  = json.loads(line)
+                    chunk = data.get("message",{}).get("content","")
+                    full += chunk; sys.stdout.write(chunk); sys.stdout.flush()
+                    if data.get("done"):
+                        elapsed = time.time() - t0
+                        tps     = data.get("eval_count",0) / max(elapsed, 0.01)
+                        _token_total += data.get("eval_count", 0)
+                        print(f"\n  {c(C.DGRAY, f'{elapsed:.1f}s · {tps:.0f}t/s')}")
+                        break
+                _msg_count += 1; return full
+            except requests.HTTPError as e:
+                err(f"HTTP {e.response.status_code}")
+                if attempt >= MAX_RETRIES: return None
             except Exception as e:
-                try: emit({"type": "error", "text": str(e)}); emit({"type": "done"})
-                except Exception: pass
+                err(f"Inference error (attempt {attempt+1}): {e}")
+                if attempt >= MAX_RETRIES: return None
         else:
-            self.send_error(404)
+            spin = Spinner("thinking").start()
+            try:
+                resp = requests.post(CHAT_URL, json=payload, timeout=240)
+                spin.stop(); resp.raise_for_status()
+                reply = resp.json().get("message",{}).get("content","")
+                print(f"\n  {c(C.CYAN+C.B,'◈ ARIA')}: {reply}\n")
+                _msg_count += 1; return reply
+            except Exception as e:
+                spin.stop(); err(f"Inference error: {e}")
+                if attempt >= MAX_RETRIES: return None
+    return None
 
-# ── minimal "waiting for approval" page for unapproved LAN devices ──
-WAIT_HTML = r"""<!DOCTYPE html><html><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Aria — Waiting</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0e0f11;color:#e8eaed;
-display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
-.box{max-width:360px;padding:32px}
-.mark{width:48px;height:48px;border-radius:14px;background:#e8eaed;color:#16181d;display:flex;align-items:center;
-justify-content:center;font-size:20px;margin:0 auto 16px;font-weight:700}
-h1{font-size:18px;margin-bottom:8px}p{color:#8a94a0;font-size:13.5px;line-height:1.6}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#b7940e;margin-right:6px;
-animation:pu 1.2s ease-in-out infinite}
-@keyframes pu{0%,100%{opacity:.35}50%{opacity:1}}
-.ip{font-family:monospace;color:#e8eaed}
-</style></head><body><div class="box">
-<div class="mark">✦</div><h1><span class="dot"></span>Waiting for approval</h1>
-<p>This device (<span class="ip">__IP__</span>) is asking to connect to Aria.
-Approve the request on the host device to continue. This page will refresh automatically.</p>
-</div>
-<script>setTimeout(()=>location.reload(),3000)</script>
-</body></html>"""
+# ═══════════════════════════════════════════════════════════════════════
+#  AUTONOMOUS LOOP
+# ═══════════════════════════════════════════════════════════════════════
 
-# ── UI ─────────────────────────────────────────────────────────────
-HTML = r"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Aria</title><style>
-:root{--bg:#fff;--soft:#f4f5f6;--softer:#f9fafb;--bd:#e2e4e8;--bdh:#cdd0d6;--tx:#16181d;--mut:#63707a;--dim:#94a0ab;
---ac:#16181d;--acs:rgba(22,24,29,.07);--ok:#0e9f6e;--err:#d92d3f;--warn:#b7940e;--rs:10px;--rsm:8px;--msg:14.5px;--maxw:740px;
---ink:linear-gradient(135deg,#15171c 0%,#4b4f59 50%,#8a8f9b 100%);--pre:#0c0d0f;--pretx:#e2e6ed;
---mono:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;
---sans:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Display','Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
---sh:0 1px 3px rgba(20,22,28,.04),0 8px 28px rgba(20,22,28,.06);--ease:cubic-bezier(.25,.1,.25,1)}
-[data-theme=dark]{--bg:#0e0f11;--soft:#141519;--softer:#191a1f;--bd:#23252b;--bdh:#2f323a;--tx:#e8eaed;--mut:#8a94a0;
---dim:#5a6370;--acs:rgba(232,234,237,.07);--ink:linear-gradient(135deg,#f2f3f6 0%,#b9bec9 50%,#7e8693 100%);--pre:#060708;
---sh:0 1px 3px rgba(0,0,0,.3),0 8px 28px rgba(0,0,0,.4)}
-*{margin:0;padding:0;box-sizing:border-box}html,body{height:100%}
-body{font-family:var(--sans);background:var(--bg);color:var(--tx);font-size:14px;line-height:1.6;overflow:hidden;
--webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
-button{font:inherit;color:inherit;background:none;border:none;cursor:pointer;outline:none}
-input,select,textarea{font:inherit;color:inherit;outline:none}
-a{color:var(--ac);text-decoration:underline;text-decoration-color:var(--bdh)}
-::-webkit-scrollbar{width:7px}::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:var(--bdh);border-radius:99px;border:2px solid transparent;background-clip:content-box}
-::-webkit-scrollbar-thumb:hover{background:var(--dim);background-clip:content-box}
-#splash{position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;
-background:linear-gradient(160deg,#fcfcfd,#f2f3f5 50%,#e8eaee);transition:opacity .5s ease}
-[data-theme=dark] #splash{background:linear-gradient(160deg,#141519,#0e0f11 50%,#08090a)}
-#splash.fade{opacity:0;pointer-events:none}
-#splash .logo{display:flex;flex-direction:column;align-items:center;gap:8px;opacity:0;animation:wIn .7s var(--ease) .05s forwards}
-#splash .mark2{width:52px;height:52px;border-radius:16px;background:var(--ac);color:var(--bg);display:flex;align-items:center;justify-content:center;font-size:22px}
-[data-theme=dark] #splash .mark2{background:#e8eaed;color:#16181d}
-#splash h1{font-size:clamp(28px,5vw,48px);font-weight:700;letter-spacing:-.03em;background:var(--ink);
--webkit-background-clip:text;background-clip:text;color:transparent}
-#splash .tag{color:var(--dim);font-size:clamp(13px,2vw,15px);letter-spacing:.02em;margin-top:-2px}
-@keyframes wIn{0%{opacity:0;transform:translateY(16px);filter:blur(6px)}100%{opacity:1;transform:none;filter:blur(0)}}
-@keyframes mIn{0%{opacity:0;transform:translateY(6px)}100%{opacity:1;transform:none}}
-@keyframes bl{50%{opacity:0}}
-@keyframes pu{0%,100%{transform:scale(.55);opacity:.4}50%{transform:scale(1);opacity:1}}
-@keyframes rot{100%{transform:rotate(360deg)}}
-@keyframes tIn{0%{opacity:0;transform:translateY(18px) scale(.92)}100%{opacity:1;transform:translateY(0) scale(1)}}
-@keyframes shim{0%{background-position:200% center}100%{background-position:-200% center}}
-@keyframes btnPop{0%{transform:scale(1)}50%{transform:scale(1.04)}100%{transform:scale(1)}}
-@keyframes fadeUp{0%{opacity:0;transform:translateY(8px)}100%{opacity:1;transform:none}}
-#setupOv{position:fixed;inset:0;z-index:250;display:none;align-items:center;justify-content:center;background:var(--soft);padding:20px}
-#setupOv.show{display:flex}
-.panel{width:min(440px,100%);background:var(--bg);border:1px solid var(--bd);border-radius:20px;padding:30px 32px 24px;box-shadow:var(--sh);animation:wIn .4s var(--ease)}
-.steps{display:flex;gap:6px;margin-bottom:20px}
-.steps .dot{flex:1;height:3px;border-radius:99px;background:var(--bd);transition:background .3s}.steps .dot.on{background:var(--ac)}
-.step{display:none}.step.active{display:block}
-.panel h2{font-size:19px;font-weight:700;margin-bottom:4px}
-.panel .sub{color:var(--mut);font-size:13px;margin-bottom:20px;line-height:1.5}
-.f{margin-bottom:14px}.f label{display:block;font-size:12px;font-weight:600;color:var(--mut);margin-bottom:5px;letter-spacing:.01em}
-.f select,.f input{width:100%;padding:10px 13px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--softer);transition:border-color .15s}
-.f select:focus,.f input:focus{border-color:var(--ac)}
-.f input{font-family:var(--mono);font-size:13px}
-.tline{display:flex;align-items:center;gap:9px;font-size:12.5px;min-height:20px;margin:-2px 0 10px;padding:2px 0}
-.tline .d{width:9px;height:9px;border-radius:50%;flex-shrink:0}
-.acts{display:flex;justify-content:space-between;align-items:center;margin-top:18px;gap:10px}
-.btn{padding:10px 22px;border-radius:10px;background:var(--ac);color:var(--bg);font-weight:600;font-size:13.5px;
-transition:opacity .15s,transform .12s}
-[data-theme=dark] .btn{background:#e8eaed;color:#16181d}
-.btn:active{transform:scale(.96)}
-.btn:disabled{opacity:.3;cursor:not-allowed;transform:none}
-.bg2{color:var(--mut);padding:9px 14px;border-radius:10px;font-size:13px;transition:background .12s}
-.bg2:hover{background:var(--soft);color:var(--tx)}
-#app{display:none;height:100%}#app.active{display:flex}
-aside{width:256px;flex-shrink:0;background:var(--soft);border-right:1px solid var(--bd);display:flex;flex-direction:column;
-transition:transform .25s var(--ease)}
-.shead{display:flex;align-items:center;gap:10px;padding:16px 16px 8px}
-.mark{width:30px;height:30px;border-radius:10px;background:var(--ac);color:var(--bg);display:flex;align-items:center;
-justify-content:center;font-size:14px;font-weight:700}
-[data-theme=dark] .mark{background:#e8eaed;color:#16181d}
-.shead b{font-size:15px;letter-spacing:-.01em}
-.nav{padding:0 10px 6px;display:flex;flex-direction:column;gap:2px}
-.nbtn{display:flex;align-items:center;gap:10px;padding:8px 11px;border-radius:var(--rsm);font-size:13.5px;font-weight:500;width:100%;text-align:left;transition:background .12s}
-.nbtn:hover{background:var(--acs)}.nbtn .ni{width:18px;text-align:center;font-size:14px}
-.nbtn kbd{margin-left:auto;font-size:10px;color:var(--dim);border:1px solid var(--bd);border-radius:5px;padding:1px 5px;font-family:var(--mono)}
-.nbtn.tog{background:var(--acs);font-weight:600}
-.slabel{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);font-weight:600;padding:10px 18px 5px}
-#chatList{flex:1;overflow-y:auto;padding:0 10px 8px}
-.ci{display:flex;align-items:center;width:100%;padding:6px 8px 6px 11px;border-radius:var(--rsm);color:var(--mut);font-size:13px;gap:6px;cursor:pointer;transition:background .12s}
-.ci span{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ci:hover{background:var(--acs);color:var(--tx)}.ci.on{background:var(--acs);color:var(--tx);font-weight:600}
-.ci .del{opacity:0;color:var(--dim);font-size:12px;padding:2px 5px;border-radius:6px;transition:opacity .12s}
-.ci:hover .del{opacity:1}.ci .del:hover{color:var(--err)}
-.sfoot{padding:10px 14px;border-top:1px solid var(--bd);display:flex;align-items:center;gap:9px}
-.sdot{width:7px;height:7px;border-radius:50%;background:var(--warn);flex-shrink:0}.sdot.ok{background:var(--ok)}.sdot.err{background:var(--err)}
-.sfoot small{color:var(--mut);font-size:11.5px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.gear{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--mut);transition:background .12s;position:relative}
-.gear:hover{background:var(--acs);color:var(--tx)}
-.gear .bdg{position:absolute;top:-2px;right:-2px;width:9px;height:9px;border-radius:50%;background:var(--err);
-display:none;border:2px solid var(--soft)}
-.gear .bdg.show{display:block}
-main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative}
-.top{height:50px;flex-shrink:0;border-bottom:1px solid var(--bd);display:flex;align-items:center;gap:12px;padding:0 14px;background:var(--bg)}
-.mdd{position:relative}
-.mdd>button{display:flex;align-items:center;gap:8px;padding:5px 10px;border-radius:8px;font-weight:600;font-size:13.5px;transition:background .12s}
-.mdd>button:hover{background:var(--soft)}.mdd .car{color:var(--dim);font-size:9px;margin-top:1px}
-.menu{position:absolute;top:calc(100% + 5px);left:0;min-width:240px;max-height:320px;overflow-y:auto;background:var(--bg);
-border:1px solid var(--bd);border-radius:14px;box-shadow:var(--sh);padding:5px;z-index:50;display:none;animation:fadeUp .15s var(--ease)}
-.menu.open{display:block}
-.mi{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:7px 11px;border-radius:8px;font-size:13px;transition:background .1s}
-.mi:hover{background:var(--soft)}.mi .chk{margin-left:auto;font-weight:700;opacity:0}.mi.sel .chk{opacity:1}
-.top .title{font-weight:500;color:var(--mut);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.mode{margin-left:auto;display:none;font-size:11.5px;font-weight:600;background:var(--acs);border-radius:99px;padding:4px 11px;letter-spacing:.01em}
-.mode.show{display:flex}
-#stage{flex:1;display:flex;flex-direction:column;min-height:0}
-#scroll{flex:1;overflow-y:auto;scroll-behavior:smooth}
-#thread{max-width:var(--maxw);margin:0 auto;padding:22px 20px 10px;display:flex;flex-direction:column;gap:16px}
-#heroWrap{flex:1;display:none;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:20px;animation:wIn .5s var(--ease)}
-main.empty #scroll{display:none}main.empty #heroWrap{display:flex}
-#heroGreet{font-size:clamp(20px,3vw,30px);font-weight:700;letter-spacing:-.025em;background:var(--ink);
--webkit-background-clip:text;background-clip:text;color:transparent;text-align:center}
-.srow{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:600px}
-.sg{padding:8px 16px;border:1px solid var(--bd);border-radius:99px;background:var(--bg);font-size:12.5px;color:var(--mut);
-transition:all .15s ease;cursor:pointer}
-.sg:hover{color:var(--tx);border-color:var(--bdh);box-shadow:0 1px 4px rgba(0,0,0,.04);transform:translateY(-1px)}
-.sg:active{transform:translateY(0)}
-#dock{padding:6px 20px 12px;flex-shrink:0}
-main.empty #dock{position:static;padding:0 22px 12px}
-.comp{max-width:var(--maxw);margin:0 auto;background:var(--bg);border:1px solid var(--bd);border-radius:16px;padding:10px 12px 8px;
-box-shadow:var(--sh);transition:border-color .15s,box-shadow .15s}
-.comp:focus-within{border-color:var(--ac);box-shadow:0 0 0 3px var(--acs)}
-.comp textarea{width:100%;border:none;outline:none;resize:none;font-size:14.5px;max-height:180px;line-height:1.55;background:none;padding:2px 0}
-.cbar{display:flex;align-items:center;gap:6px;margin-top:6px}
-.chip{font-size:11px;color:var(--mut);border:1px solid var(--bd);border-radius:99px;padding:3px 10px;background:var(--softer);transition:border-color .12s}
-.chip.dr{display:none;border-color:transparent;background:var(--acs);font-weight:600;color:var(--tx)}
-.chip.dr.show{display:inline-flex;gap:5px}
-#send{margin-left:auto;width:34px;height:34px;border-radius:10px;background:var(--ac);color:var(--bg);display:flex;
-align-items:center;justify-content:center;transition:transform .12s,opacity .15s,background .15s;flex-shrink:0}
-[data-theme=dark] #send{background:#e8eaed;color:#16181d}
-#send:active{transform:scale(.9)}
-#send:disabled{opacity:.2;cursor:not-allowed;transform:none}
-#send.stop{background:var(--err);color:#fff}
-#send:not(:disabled):hover{transform:scale(1.05)}
-.fnote{max-width:var(--maxw);margin:6px auto 0;text-align:center;color:var(--dim);font-size:11px;line-height:1.4}
-main.empty .fnote{display:none}
-.msg{display:flex;gap:12px;animation:mIn .2s var(--ease);position:relative;animation-fill-mode:both}
-.av{width:30px;height:30px;border-radius:10px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:13px;margin-top:1px;font-weight:600}
-.msg.user .av{background:var(--acs);font-size:15px}.msg.agent .av{background:var(--ac);color:var(--bg)}
-[data-theme=dark] .msg.agent .av{background:#e8eaed;color:#16181d}
-.bub{flex:1;min-width:0}
-.who{font-size:12px;font-weight:600;margin-bottom:3px;display:flex;align-items:center;gap:8px;color:var(--tx)}
-.who .t{font-weight:400;color:var(--dim);font-size:11px}body.nots .who .t{display:none}
-.cp{opacity:0;margin-left:auto;color:var(--dim);font-size:12px;padding:2px 7px;border-radius:6px;transition:opacity .12s,background .12s}
-.msg:hover .cp{opacity:1}.cp:hover{background:var(--soft);color:var(--tx)}
-.who .rg{opacity:0;color:var(--dim);font-size:12px;padding:2px 7px;border-radius:6px;transition:opacity .12s,background .12s}
-.msg:hover .rg{opacity:1}.rg:hover{background:var(--soft);color:var(--tx)}
-.ct{font-size:var(--msg);white-space:pre-wrap;word-wrap:break-word;line-height:1.6}
-.ct p{margin:4px 0}
-.ct ul,.ct ol{margin:4px 0 4px 1.3em}
-.ct li{margin:2px 0}
-.ct code{font-family:var(--mono);background:var(--soft);border:1px solid var(--bd);padding:1px 5px;border-radius:5px;font-size:.85em;color:var(--tx)}
-.ct pre{background:var(--pre);border-radius:var(--rs);padding:14px 16px;overflow-x:auto;margin:8px 0;white-space:pre;border:1px solid rgba(255,255,255,.04)}
-.ct pre code{background:none;border:none;padding:0;color:var(--pretx);font-size:12.5px;line-height:1.5}
-.ct :first-child{margin-top:0}.ct :last-child{margin-bottom:0}
-.cur{display:inline-block;width:7px;height:14px;background:var(--tx);vertical-align:-2px;border-radius:2px;animation:bl 1s steps(1) infinite;margin-left:1px}
-.pw{display:flex;align-items:center;gap:10px;color:var(--dim);font-size:12.5px;padding:6px 0}
-.pu{width:12px;height:12px;border-radius:50%;background:var(--tx);animation:pu 1.1s ease-in-out infinite}
-.tc{margin:6px 0 2px;border:1px solid var(--bd);border-radius:var(--rs);background:var(--bg);overflow:hidden;font-size:13px;
-border-left:3px solid var(--bdh);transition:border-color .15s,box-shadow .1s}
-.tc:hover{border-color:var(--bdh)}
-.th{display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--mut);cursor:pointer;flex-wrap:wrap;user-select:none}
-.th b{color:var(--tx);font-size:12.5px;font-weight:600}
-.th .det{font-family:var(--mono);font-size:11.5px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;max-width:280px;white-space:nowrap}
-.th .sp{width:11px;height:11px;border:2px solid var(--bdh);border-top-color:var(--tx);border-radius:50%;animation:rot .6s linear infinite;margin-left:auto;flex-shrink:0}
-.th .ok2{margin-left:auto;font-size:12px;font-weight:700;color:var(--ok);flex-shrink:0}.th .ok2.bad{color:var(--err)}
-.tconf{margin-left:auto;display:flex;align-items:center;gap:8px;flex-shrink:0;flex-wrap:wrap}
-.tconf label{display:flex;align-items:center;gap:4px;font-size:11px;color:var(--mut);font-weight:500;cursor:pointer}
-.tconf input[type=checkbox]{accent-color:var(--tx);width:13px;height:13px}
-.tconf button{font-size:11px;font-weight:600;padding:4px 11px;border-radius:99px;transition:all .1s}
-.tconf .y{background:var(--ac);color:var(--bg)}[data-theme=dark] .tconf .y{background:#e8eaed;color:#16181d}
-.tconf .y:active{transform:scale(.95)}
-.tconf .n{border:1px solid var(--bd);color:var(--mut)}.tconf .n:hover{background:var(--soft)}
-.tb{position:relative;display:none;border-top:1px solid var(--bd);padding:9px 12px;font-family:var(--mono);font-size:12px;color:var(--mut);
-white-space:pre-wrap;max-height:180px;overflow-y:auto;background:var(--softer);line-height:1.45;animation:fadeUp .15s var(--ease)}
-.tc.open .tb{display:block}
-.tb .cpo{position:sticky;float:right;top:0;right:0;font-size:10.5px;font-weight:600;color:var(--mut);
-background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:2px 7px;opacity:.85}
-.tb .cpo:hover{opacity:1;background:var(--soft)}
-#setOv{position:fixed;inset:0;z-index:130;background:rgba(0,0,0,.25);display:none;backdrop-filter:blur(2px)}
-[data-theme=dark] #setOv{background:rgba(0,0,0,.45)}
-#setOv.show{display:block}
-.set{position:absolute;top:0;right:0;bottom:0;width:min(380px,100%);background:var(--bg);
-box-shadow:-4px 0 30px rgba(0,0,0,.07);padding:20px 24px;overflow-y:auto;transform:translateX(100%);transition:transform .25s var(--ease)}
-[data-theme=dark] .set{box-shadow:-4px 0 30px rgba(0,0,0,.3)}
-#setOv.show .set{transform:none}
-.set h3{font-size:17px;font-weight:700;letter-spacing:-.01em}.set .x{position:absolute;top:14px;right:14px;width:28px;height:28px;border-radius:8px;color:var(--mut);font-size:16px}
-.set .x:hover{background:var(--soft)}
-.sec{margin-top:20px}.sec>label{display:block;font-size:10.5px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--dim);margin-bottom:8px}
-.sr{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:6px 0;font-size:13.5px}
-.sr .s2{color:var(--dim);font-size:11px;display:block;margin-top:1px}
-.sr input[type=range]{width:110px;accent-color:var(--tx);height:4px}
-.sw{display:flex;gap:6px}
-.swb{width:24px;height:24px;border-radius:50%;border:2px solid transparent;cursor:pointer;transition:border-color .12s,transform .12s}
-.swb:hover{transform:scale(1.15)}
-.swb.sel{border-color:var(--tx);box-shadow:inset 0 0 0 2px var(--bg);transform:scale(1.1)}
-.seg{display:flex;border:1px solid var(--bd);border-radius:99px;overflow:hidden}
-.seg button{padding:4px 12px;font-size:12px;font-weight:600;color:var(--mut);transition:all .12s;background:transparent}
-.seg button.on{background:var(--ac);color:var(--bg)}[data-theme=dark] .seg button.on{background:#e8eaed;color:#16181d}
-.tgl{width:34px;height:18px;border-radius:99px;background:var(--bdh);position:relative;transition:background .15s;flex-shrink:0;cursor:pointer}
-.tgl::after{content:'';position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--bg);transition:left .15s;box-shadow:0 1px 2px rgba(0,0,0,.15)}
-.tgl.on{background:var(--ok)}.tgl.on::after{left:18px}
-.set textarea,.set input[type=text]{width:100%;padding:8px 11px;border:1px solid var(--bd);border-radius:var(--rsm);background:var(--softer);font-size:13px;transition:border-color .15s}
-.set textarea:focus,.set input[type=text]:focus{border-color:var(--ac)}
-.set textarea{resize:vertical;min-height:56px;font-family:var(--mono);font-size:12.5px}
-.lk{font-size:13px;font-weight:600;padding:7px 0;color:var(--tx);cursor:pointer;display:inline-block;transition:opacity .12s;text-decoration:none}
-.lk:hover{opacity:.7}
-#connInfo{font-size:13.5px;font-weight:500}
-#connInfo .s2{display:block;font-size:11px;font-weight:400;color:var(--dim);margin-top:1px}
-.dev{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;border:1px solid var(--bd);
-border-radius:10px;margin-bottom:6px;font-size:12.5px}
-.dev .di{font-family:var(--mono);font-size:12px}
-.dev .da{display:flex;gap:6px}
-.dev button{font-size:11px;font-weight:600;padding:4px 10px;border-radius:99px}
-.dev .y{background:var(--ac);color:var(--bg)}[data-theme=dark] .dev .y{background:#e8eaed;color:#16181d}
-.dev .n{border:1px solid var(--bd);color:var(--mut)}.dev .n:hover{background:var(--soft)}
-.dev .you{color:var(--dim);font-size:11px}
-@media(max-width:760px){
-aside{display:none;position:fixed;top:0;left:0;bottom:0;z-index:110;box-shadow:4px 0 30px rgba(0,0,0,.12);
-border-right:none;transform:translateX(-100%)}
-[data-theme=dark] aside{box-shadow:4px 0 30px rgba(0,0,0,.4)}
-aside.show{display:flex;transform:none}.ham{display:flex}.ham.show{display:none}
-#scrlBtn{bottom:70px}#toast{bottom:14px}.top{padding:0 10px 0 44px}
-}
-.ham{display:none;position:fixed;top:10px;left:10px;z-index:120;width:32px;height:32px;border-radius:8px;
-background:var(--bg);border:1px solid var(--bd);align-items:center;justify-content:center;font-size:16px;color:var(--tx);
-box-shadow:0 1px 3px rgba(0,0,0,.05);transition:background .12s}
-.ham:active{transform:scale(.92)}
-#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:500;display:flex;flex-direction:column;
-align-items:center;gap:6px;pointer-events:none}
-.tst{background:var(--tx);color:var(--bg);padding:8px 18px;border-radius:10px;font-size:13px;font-weight:500;
-box-shadow:0 4px 24px rgba(0,0,0,.2);animation:tIn .25s ease;pointer-events:auto}
-[data-theme=dark] .tst{background:#e8eaed;color:#16181d}
-.tst.access{background:var(--bg);color:var(--tx);border:1px solid var(--bd);box-shadow:var(--sh);padding:12px 16px;
-display:flex;flex-direction:column;gap:8px;text-align:left;min-width:260px}
-.tst.access b{font-size:13px}.tst.access .ip{font-family:var(--mono);color:var(--mut);font-size:12px}
-.tst.access .row{display:flex;gap:6px;justify-content:flex-end}
-.tst.access button{font-size:12px;font-weight:600;padding:5px 14px;border-radius:99px}
-.tst.access .y{background:var(--ac);color:var(--bg)}[data-theme=dark] .tst.access .y{background:#e8eaed;color:#16181d}
-.tst.access .n{border:1px solid var(--bd);color:var(--mut)}.tst.access .n:hover{background:var(--soft)}
-#scrlBtn{position:absolute;bottom:90px;left:50%;transform:translateX(-50%);z-index:30;width:36px;height:36px;
-border-radius:50%;background:var(--bg);border:1px solid var(--bd);box-shadow:0 2px 12px rgba(0,0,0,.08);font-size:15px;
-display:none;align-items:center;justify-content:center;color:var(--tx);transition:transform .12s,opacity .15s,box-shadow .12s}
-#scrlBtn:hover{box-shadow:0 4px 16px rgba(0,0,0,.12)}
-[data-theme=dark] #scrlBtn{box-shadow:0 2px 12px rgba(0,0,0,.2)}
-#scrlBtn.show{display:flex}#scrlBtn:active{transform:translateX(-50%) scale(.88)}
-*{transition:background .18s ease,border-color .18s ease,color .18s ease,box-shadow .18s ease;scrollbar-width:thin}
-.tc{transition:border-color .15s,box-shadow .1s}
-.sg,.chip,.btn,.bg2,.mi,.nbtn,.ci,.gear,.swb,.tgl,.lk{transition:all .12s ease}
-</style></head><body>
-<div id="splash"><div class="logo"><div class="mark2">✦</div><h1 id="wt">Welcome, user.</h1><div class="tag">Local AI agent with real tools</div></div></div>
-<div id="setupOv"><div class="panel">
- <div class="steps" id="stepDots"><div class="dot on"></div><div class="dot"></div></div>
- <div class="step active" data-step="1"><h2>Choose your platform</h2><p class="sub">Which local model runtime are you using?</p>
-  <div class="f"><label>Platform</label><select id="platform"><option value="" disabled selected>Select…</option>
-   <option value="ollama">🦙 Ollama</option><option value="lmstudio">🧪 LM Studio</option>
-   <option value="opencode">⌘ OpenCode</option><option value="other">⚙️ Something else (OpenAI-compatible)</option></select></div>
-  <div class="acts"><span></span><button class="btn" id="s2" disabled>Continue →</button></div></div>
- <div class="step" data-step="2"><h2>Set it up</h2><p class="sub">Reconfigure anytime in Settings.</p>
-  <div class="f"><label>Endpoint URL</label><input type="text" id="endpoint" spellcheck="false" placeholder="http://localhost:11434"></div>
-  <div class="tline" id="tline"></div>
-  <div class="f"><label>Default model</label><select id="setupModel"><option value="">— click Test to list models —</option></select></div>
-  <div class="acts"><button class="bg2" id="b1">← Back</button>
-   <div style="display:flex;gap:8px"><button class="bg2" id="testBtn">Test Connection</button><button class="btn" id="finishBtn">Start →</button></div></div></div>
-</div></div>
-<div id="app"><button class="ham" id="hamBtn">☰</button><aside>
- <div class="shead"><div class="mark">✦</div><b>Aria</b></div>
- <div class="nav">
-  <button class="nbtn" id="newChat"><span class="ni">✚</span>New Chat<kbd>⌘K</kbd></button>
-  <button class="nbtn" id="deepBtn"><span class="ni">◎</span>Deep research</button></div>
- <div class="slabel">Chats</div><div id="chatList"></div>
- <div class="sfoot"><div class="sdot" id="sdot"></div><small id="stext">Connecting…</small>
-  <button class="gear" id="gearBtn">⚙<span class="bdg" id="gearBdg"></span></button></div></aside>
-<main id="main" class="empty">
- <div class="top">
-  <div class="mdd"><button id="modelBtn"><span id="modelName">—</span><span class="car">▼</span></button>
-   <div class="menu" id="modelMenu"></div></div>
-  <span class="title" id="chatTitle"></span><span class="mode" id="modeChip">◎ Deep research</span></div>
- <div id="stage">
-  <div id="heroWrap"><div id="heroGreet">How can I help?</div>
-   <div class="srow" id="srow">
-    <button class="sg" data-p="What OS and hardware am I running on?">🖥️ System info</button>
-    <button class="sg" data-p="List the files here and summarize this project.">📖 Explore folder</button>
-    <button class="sg" data-p="Search the web for the latest stable Python version.">🔎 Web search</button>
-    <button class="sg" data-p="Create a simple landing page in landing/index.html for a chatbot product.">✏️ Build a page</button></div></div>
-  <div id="scroll"><div id="thread"></div></div>
-  <button id="scrlBtn">↓</button>
-  <div id="dock"><div class="comp">
-    <textarea id="input" rows="1" placeholder="Message Aria…"></textarea>
-    <div class="cbar"><span class="chip" id="provChip">—</span>
-     <span class="chip dr" id="drChip">◎ Deep research <button id="drOff">✕</button></span>
-     <button id="send" disabled>➤</button></div></div>
-   <div class="fnote">Real tools on your machine · <kbd style="background:var(--soft);border:1px solid var(--bd);border-radius:3px;padding:0 5px;font-family:var(--mono);font-size:10px">Esc</kbd> stop · <kbd style="background:var(--soft);border:1px solid var(--bd);border-radius:3px;padding:0 5px;font-family:var(--mono);font-size:10px">⌘K</kbd> new chat · <kbd style="background:var(--soft);border:1px solid var(--bd);border-radius:3px;padding:0 5px;font-family:var(--mono);font-size:10px">⌘B</kbd> sidebar · <kbd style="background:var(--soft);border:1px solid var(--bd);border-radius:3px;padding:0 5px;font-family:var(--mono);font-size:10px">?</kbd> help</div></div>
- </div></main></div>
-<div id="setOv"><div class="set">
- <button class="x" id="xSet">✕</button><h3>Settings</h3>
- <div class="sec"><label>Appearance</label>
-  <div class="sr"><span>Theme</span><div class="seg" id="themeSeg">
-   <button data-v="light">Light</button><button data-v="dark">Dark</button><button data-v="auto">Auto</button></div></div>
-  <div class="sr"><span>Accent</span><div class="sw" id="sw">
-   <button class="swb" data-c="#16181d" style="background:#16181d"></button>
-   <button class="swb" data-c="#3b6ef5" style="background:#3b6ef5"></button>
-   <button class="swb" data-c="#7c3aed" style="background:#7c3aed"></button>
-   <button class="swb" data-c="#16a36b" style="background:#16a36b"></button>
-   <button class="swb" data-c="#e25822" style="background:#e25822"></button></div></div>
-  <div class="sr"><span>Text size</span><input type="range" id="fsz" min="13" max="17" step="0.5"></div>
-  <div class="sr"><span>Chat width</span><div class="seg" id="widthSeg">
-   <button data-v="740px">Cozy</button><button data-v="940px">Wide</button></div></div>
-  <div class="sr"><span>Timestamps</span><button class="tgl" id="tsTgl"></button></div>
-  <div class="sr"><span>Auto-expand tool output</span><button class="tgl" id="expTgl"></button></div></div>
- <div class="sec"><label>Personalization</label>
-  <div class="sr" style="display:block"><span style="display:block;margin-bottom:5px">Your name</span><input type="text" id="nm"></div>
-  <div class="sr" style="display:block"><span style="display:block;margin-bottom:5px">System prompt</span><textarea id="sp"></textarea></div>
-  <div class="sr"><span>Temperature<span class="s2" id="tv">0.7</span></span><input type="range" id="tp" min="0" max="2" step="0.1"></div></div>
- <div class="sec"><label>Safety</label>
-  <div class="sr"><span>Confirm shell commands</span><button class="tgl" id="shT"></button></div>
-  <div class="sr"><span>Confirm file writes</span><button class="tgl" id="wrT"></button></div></div>
- <div class="sec" id="accessSec"><label>Network access</label>
-  <div class="sr" style="display:block"><span class="s2" style="margin-bottom:6px;display:block">Devices on your network can request access to this Aria instance. Approve or remove them below.</span>
-   <div id="devList"></div></div></div>
- <div class="sec"><label>Data</label>
-  <div class="sr"><span>Export this chat (JSON)</span><button class="lk" id="exportBtn">Download ↓</button></div></div>
- <div class="sec"><label>Connection</label>
-  <div class="sr"><span id="connInfo">—</span></div>
-  <button class="lk" id="reconfig">Change platform / endpoint →</button></div>
-</div></div>
-<script>
-(()=>{
-const $=s=>document.querySelector(s),$$=s=>document.querySelectorAll(s);
-const K='aria.cfg',KC='aria.chats';
-const URLS={ollama:'http://localhost:11434',lmstudio:'http://localhost:1234/v1',opencode:'http://localhost:4096/v1',other:'http://localhost:8080/v1'};
-const PLAT={ollama:'🦙 Ollama',lmstudio:'🧪 LM Studio',opencode:'⌘ OpenCode',other:'⚙️ Custom'};
-const IC={read_file:'📖',write_file:'✏️',edit_file:'🪄',shell:'🖥️',search:'🔎',browse:'🌐'};
-const DEF={userName:'user',sysPrompt:'You are Aria (Autonomous Reasoning Intelligent Agent), a powerful local AI agent. Reason step by step, act autonomously with your tools, and be direct and concise.',temp:0.7,
-accent:'#16181d',fontSize:14.5,theme:'auto',width:'740px',timestamps:true,expandTools:false,
-confirmShell:true,confirmWrite:true,deepResearch:false};
-let cfg=null;try{cfg=JSON.parse(localStorage.getItem(K))}catch(e){}
-if(cfg)cfg={...DEF,...cfg};
-const st={chats:[],cur:null,busy:false,abort:null,online:false,models:[],isHost:false};
-try{st.chats=JSON.parse(localStorage.getItem(KC))||[]}catch(e){}
-const save=()=>localStorage.setItem(K,JSON.stringify(cfg)),saveC=()=>localStorage.setItem(KC,JSON.stringify(st.chats));
-const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-// Markdown: code blocks/inline code, bold, links, and simple lists.
-const md=s=>{
- let o=esc(s);
- o=o.replace(/```(\w*)\n([\s\S]*?)(```|$)/g,(_,l,c)=>`<pre><code>${c}</code></pre>`);
- const blocks=o.split(/(<pre>[\s\S]*?<\/pre>)/g);
- o=blocks.map(b=>{
-  if(b.startsWith('<pre>'))return b;
-  b=b.replace(/`([^`\n]+)`/g,'<code>$1</code>');
-  b=b.replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>');
-  b=b.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
-  b=b.replace(/(^|\s)(https?:\/\/[^\s<]+)/g,(m,p,u)=>`${p}<a href="${u}" target="_blank" rel="noopener">${u}</a>`);
-  // group consecutive list lines into <ul>/<ol>
-  const lines=b.split('\n');let out=[],mode=null;
-  for(const ln of lines){
-   const um=ln.match(/^\s*[-*]\s+(.*)/),om=ln.match(/^\s*\d+[.)]\s+(.*)/);
-   if(um){if(mode!=='ul'){if(mode)out.push(`</${mode}>`);out.push('<ul>');mode='ul'}out.push(`<li>${um[1]}</li>`)}
-   else if(om){if(mode!=='ol'){if(mode)out.push(`</${mode}>`);out.push('<ol>');mode='ol'}out.push(`<li>${om[1]}</li>`)}
-   else{if(mode){out.push(`</${mode}>`);mode=null}out.push(ln)}
-  }
-  if(mode)out.push(`</${mode}>`);
-  return out.join('\n')
- }).join('');
- return o};
-function theme(){
- const dark=cfg.theme==='dark'||(cfg.theme==='auto'&&matchMedia('(prefers-color-scheme: dark)').matches);
- document.documentElement.dataset.theme=dark?'dark':'light';
- const r=document.documentElement.style,n=parseInt(cfg.accent.slice(1),16);
- r.setProperty('--ac',cfg.accent);r.setProperty('--acs',`rgba(${n>>16&255},${n>>8&255},${n&255},.1)`);
- r.setProperty('--msg',cfg.fontSize+'px');r.setProperty('--maxw',cfg.width);
- document.body.classList.toggle('nots',!cfg.timestamps)}
-matchMedia('(prefers-color-scheme: dark)').addEventListener('change',()=>cfg&&theme());
-$('#wt').textContent=`Welcome, ${cfg?.userName||'user'}.`;if(cfg)theme();
-setTimeout(()=>{$('#splash').classList.add('fade');setTimeout(()=>cfg?enter():$('#setupOv').classList.add('show'),200)},1000);
-const goStep=n=>{$$('.step').forEach(s=>s.classList.toggle('active',s.dataset.step==n));
- $$('#stepDots .dot').forEach((d,i)=>d.classList.toggle('on',i+1==n))};
-$('#platform').onchange=e=>$('#s2').disabled=!e.target.value;
-$('#s2').onclick=()=>{$('#endpoint').value=cfg?.baseUrl||URLS[$('#platform').value];$('#tline').innerHTML='';goStep(2)};
-$('#b1').onclick=()=>goStep(1);
-async function getModels(p,u){try{const r=await fetch(`/api/models?platform=${encodeURIComponent(p)}&url=${encodeURIComponent(u)}`);
- const j=await r.json();return j.ok?j.models:null}catch(e){return null}}
-$('#testBtn').onclick=async()=>{const l=$('#tline');
- l.innerHTML='<span class="d" style="background:var(--warn)"></span><span>Testing connection…</span>';
- const m=await getModels($('#platform').value,$('#endpoint').value.trim());
- if(m){l.innerHTML=`<span class="d" style="background:var(--ok)"></span><span style="color:var(--ok)">Connected — ${m.length} model${m.length!==1?'s':''}</span>`;
-  $('#setupModel').innerHTML=m.map(x=>`<option>${x}</option>`).join('');$('#setupModel').value=m[0]}
- else{const r=await fetch(`/api/models?platform=${encodeURIComponent($('#platform').value)}&url=${encodeURIComponent($('#endpoint').value.trim())}`);
-  const j=await r.json();
-  l.innerHTML=`<span class="d" style="background:var(--err)"></span><span style="color:var(--err)">${j.error||'Unreachable — check your runtime'}</span>`}};
-$('#finishBtn').onclick=()=>{cfg={...DEF,...(cfg||{}),platform:$('#platform').value,
- baseUrl:$('#endpoint').value.trim().replace(/\/$/,''),model:$('#setupModel').value||''};
- save();$('#setupOv').classList.remove('show');enter()};
-async function connect(){const m=await getModels(cfg.platform,cfg.baseUrl);
- if(m&&m.length){st.online=true;st.models=m;if(!m.includes(cfg.model))cfg.model=m[0];
-  if(!cfg.model&&st.models[0])cfg.model=st.models[0];
-  $('#sdot').className='sdot ok';$('#stext').textContent='Connected · '+cfg.baseUrl.replace(/^https?:\/\//,'')}
- else{st.online=false;st.models=[];$('#sdot').className='sdot err';$('#stext').textContent='Offline';
-  const r=await fetch(`/api/models?platform=${encodeURIComponent(cfg.platform)}&url=${encodeURIComponent(cfg.baseUrl)}`);
-  const j=await r.json();$('#stext').textContent=j.error||'Offline — start '+(PLAT[cfg.platform]||'runtime')}
- mm();save()}
-function mm(){const rm=$('#modelName');if(rm)rm.textContent=cfg.model||'—';
- const mu=$('#modelMenu');if(!mu)return;
- let html=st.models.map(m=>`<button class="mi ${m===cfg.model?'sel':''}" data-m="${m}">${m}<span class="chk">✓</span></button>`).join('');
- if(st.online)html+=`<div style="border-top:1px solid var(--bd);margin:4px 0;padding:4px 0">
-  <button class="mi" id="refreshModels" style="color:var(--mut);font-size:12.5px">↻ Refresh models</button></div>`;
- mu.innerHTML=html||'<div style="padding:10px;color:var(--dim);font-size:12.5px">No models found</div>';
- const rf=document.getElementById('refreshModels');
- if(rf)rf.onclick=async e=>{e.stopPropagation();rf.textContent='↻ Refreshing…';rf.disabled=true;
-  const m=await getModels(cfg.platform,cfg.baseUrl);
-  if(m&&m.length){st.models=m;if(!m.includes(cfg.model))cfg.model=m[0];mm();save();toast('Models refreshed')}
-  else{rf.textContent='↻ Refresh models';rf.disabled=false;toast('Could not refresh models','err')}}}
-$('#modelBtn').onclick=e=>{e.stopPropagation();$('#modelMenu').classList.toggle('open')};
-$('#modelMenu').onclick=e=>{const i=e.target.closest('.mi');if(!i)return;
- cfg.model=i.dataset.m;save();mm();$('#modelMenu').classList.remove('open')};
-document.addEventListener('click',()=>$('#modelMenu').classList.remove('open'));
-function enter(){theme();$('#app').classList.add('active');
- $('#provChip').textContent=PLAT[cfg.platform]||cfg.platform;
- $('#heroGreet').textContent=`How can I help, ${cfg.userName}?`;
- if(!st.cur){st.cur=st.chats[0]||null;if(!st.cur)nc(true)}
- sUI();rc();rt();connect();initAccess();setTimeout(()=>$('#input').focus(),40)}
-$('#sdot').onclick=()=>{if(!st.online){$('#stext').textContent='Reconnecting…';$('#sdot').className='sdot';
- connect()}};
+def autonomous_loop(messages: list[dict]) -> str:
+    final_reply = ""; consecutive_plain = 0
+    for loop in range(MAX_TOOL_LOOPS):
+        reply = run_inference(messages)
+        if not reply: break
+        messages.append({"role": "assistant", "content": reply})
+        final_reply = reply
+        tool_used, tool_result, tool_name = process_tools(reply)
+        if tool_used:
+            consecutive_plain = 0
+            info(f"loop {loop+1}  tool={c(C.CYAN, tool_name)}")
+            messages.append({"role": "user", "content":
+                f"[{tool_name} result]\n{tool_result}\n\n"
+                "Continue with next tool if needed, or give your final answer if done."})
+        else:
+            consecutive_plain += 1
+            if consecutive_plain >= 2: break
+            messages.append({"role": "user", "content":
+                "Task complete? If yes, give final summary. If not, use a tool."})
+    else:
+        warn(f"Tool loop limit reached ({MAX_TOOL_LOOPS})")
+    return final_reply
 
-// ── LAN access control (host side) ─────────────────────────────────
-function initAccess(){
- checkHostStatus();
- setInterval(pollAccess,3000);pollAccess();
-}
-async function checkHostStatus(){
- try{const r=await fetch('/api/access/status');const j=await r.json();st.isHost=!!j.isHost;
-  $('#accessSec').style.display=st.isHost?'':'none'}catch(e){}
-}
-const shownAccess=new Set();
-async function pollAccess(){
- if(!st.isHost)return;
- try{
-  const r=await fetch('/api/access/pending');const j=await r.json();
-  $('#gearBdg').classList.toggle('show',(j.pending||[]).length>0);
-  renderDevList(j.pending||[],j.trusted||[]);
-  for(const p of (j.pending||[])){
-   if(shownAccess.has(p.ip))continue;shownAccess.add(p.ip);
-   accessToast(p.ip,p.ua)}
- }catch(e){}
-}
-function renderDevList(pending,trusted){
- const el=$('#devList');if(!el)return;
- let html='';
- for(const p of pending){
-  html+=`<div class="dev"><span class="di">${esc(p.ip)} <span class="you">new request</span></span>
-  <div class="da"><button class="n" data-ip="${esc(p.ip)}" data-a="0">Deny</button>
-  <button class="y" data-ip="${esc(p.ip)}" data-a="1">Allow</button></div></div>`}
- for(const ip of trusted){
-  html+=`<div class="dev"><span class="di">${esc(ip)} ${ip===location.hostname||ip==='127.0.0.1'?'<span class="you">(this device)</span>':''}</span>
-  <div class="da">${ip!=='127.0.0.1'?`<button class="n" data-ip="${esc(ip)}" data-a="0">Remove</button>`:''}</div></div>`}
- el.innerHTML=html||'<div class="s2">No other devices have connected.</div>';
- el.onclick=e=>{const b=e.target.closest('button');if(!b)return;respondAccess(b.dataset.ip,b.dataset.a==='1')}
-}
-async function respondAccess(ip,approve){
- await fetch('/api/access/respond',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({ip,approve})});
- shownAccess.delete(ip);pollAccess();
- document.querySelectorAll(`.tst[data-ip="${ip}"]`).forEach(t=>t.remove())}
-function accessToast(ip,ua){
- const d=document.createElement('div');d.className='tst access';d.dataset.ip=ip;
- d.innerHTML=`<b>New device wants to connect</b><span class="ip">${esc(ip)}</span>
-  <span class="s2" style="font-size:11px;color:var(--dim)">${esc((ua||'').slice(0,60))}</span>
-  <div class="row"><button class="n" data-a="0">Deny</button><button class="y" data-a="1">Allow</button></div>`;
- d.querySelector('.row').onclick=e=>{const b=e.target.closest('button');if(!b)return;
-  respondAccess(ip,b.dataset.a==='1');d.remove()};
- $('#toast').appendChild(d)}
+# ═══════════════════════════════════════════════════════════════════════
+#  /CODE MODE  — with persistent memory
+# ═══════════════════════════════════════════════════════════════════════
 
-function nc(s){const c={id:Date.now(),title:'New chat',msgs:[]};st.chats.unshift(c);st.cur=c;saveC();
- if(!s){rc();rt();$('#input').focus()}}
-$('#newChat').onclick=()=>nc();
-document.addEventListener('keydown',e=>{
-  if((e.metaKey||e.ctrlKey)&&e.key==='k'){e.preventDefault();nc()}
-  if((e.metaKey||e.ctrlKey)&&e.key==='b'){e.preventDefault();$('#hamBtn').click()}
-  if(e.key==='Escape'){if($('#setOv').classList.contains('show'))$('#xSet').click();
-   else if(st.busy)stopGen();
-   if($('aside').classList.contains('show'))$('#hamBtn').click()}
-  if(e.key==='?'&&!e.metaKey&&!e.ctrlKey&&!e.altKey){
-   if(document.activeElement===$('#input'))return;
-   e.preventDefault();toast('⌘K New chat  ·  ⌘B Sidebar  ·  Esc Stop/settings  ·  ⚙ Settings')}});
-function rc(){$('#chatList').innerHTML=st.chats.map(c=>
- `<div class="ci ${c===st.cur?'on':''}" data-id="${c.id}"><span>${esc(c.title)}</span><button class="del" data-del="${c.id}">✕</button></div>`).join('')}
-$('#chatList').onclick=e=>{const d=e.target.closest('[data-del]');
- if(d){st.chats=st.chats.filter(c=>c.id!=d.dataset.del);
-  if(st.cur?.id==d.dataset.del)st.cur=st.chats[0]||null;if(!st.cur)nc(true);saveC();rc();rt();return}
- const i=e.target.closest('.ci');if(!i)return;st.cur=st.chats.find(c=>c.id==i.dataset.id);rc();rt()};
-$('#chatList').ondblclick=e=>{const i=e.target.closest('.ci');if(!i)return;
- const c=st.chats.find(x=>x.id==i.dataset.id);const t=prompt('Rename chat:',c.title);
- if(t){c.title=t.slice(0,60);saveC();rc();if(c===st.cur)$('#chatTitle').textContent=c.title}};
-$('#deepBtn').onclick=()=>{cfg.deepResearch=!cfg.deepResearch;save();dr()};
-$('#drOff').onclick=e=>{e.stopPropagation();cfg.deepResearch=false;save();dr()};
-function dr(){$('#deepBtn').classList.toggle('tog',cfg.deepResearch);
- $('#modeChip').classList.toggle('show',cfg.deepResearch);$('#drChip').classList.toggle('show',cfg.deepResearch)}
-function rt(){const has=st.cur.msgs.length>0;$('#main').classList.toggle('empty',!has);
- $('#chatTitle').textContent=has?st.cur.title:'';const t=$('#thread');t.innerHTML='';
- st.cur.msgs.forEach((m,i)=>t.appendChild(me(m,i)));sd(true)}
-function me(m,idx){const d=document.createElement('div');d.className=`msg ${m.role==='user'?'user':'agent'}`;
- const isLastAgent=m.role!=='user'&&idx===st.cur.msgs.length-1;
- d.innerHTML=`<div class="av">${m.role==='user'?'🧑':'✦'}</div><div class="bub">
- <div class="who">${m.role==='user'?esc(cfg.userName):'Aria'}<span class="t">${m.time||''}</span>
- ${isLastAgent?'<button class="rg" title="Regenerate">↻</button>':''}
- <button class="cp" title="Copy">⧉</button></div><div class="tools"></div><div class="ct">${md(m.text||'')}</div></div>`;
- d.querySelector('.cp').onclick=()=>{navigator.clipboard?.writeText(m.text||'');
- if(navigator.clipboard)toast('Copied!')};
- const rg=d.querySelector('.rg');if(rg)rg.onclick=()=>regenerate();
- return d}
-const sd=i=>{const s=$('#scroll');s.scrollTo({top:s.scrollHeight,behavior:i?'auto':'smooth'});
- s.dispatchEvent(new Event('scroll'))};
-const now=()=>new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
-function drop(){const m=$('#main');if(!m.classList.contains('empty'))return;
- const d=$('#dock'),a=d.getBoundingClientRect();m.classList.remove('empty');
- const b=d.getBoundingClientRect();
- d.animate([{transform:`translateY(${a.top-b.top}px)`},{transform:'none'}],{duration:280,easing:'cubic-bezier(.2,.8,.2,1)'})}
-const inp=$('#input'),sb=$('#send');
-inp.oninput=()=>{inp.style.height='auto';inp.style.height=Math.min(inp.scrollHeight,200)+'px';
- sb.disabled=!inp.value.trim()&&!st.busy};
-$('#scroll').onscroll=()=>{const s=$('#scroll'),b=$('#scrlBtn');
- b.classList.toggle('show',s.scrollTop<s.scrollHeight-s.clientHeight-80)};
-$('#scrlBtn').onclick=()=>{$('#scroll').scrollTo({top:$('#scroll').scrollHeight,behavior:'smooth'})};
-$('#hamBtn').onclick=()=>{$('aside').classList.toggle('show');$('#hamBtn').textContent=$('aside').classList.contains('show')?'✕':'☰'};
-inp.onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();if(inp.value.trim())send()}};
-sb.onclick=()=>{if(st.busy){stopGen();return}send()};
-$('#srow').onclick=e=>{const s=e.target.closest('.sg');if(!s)return;
- inp.value=s.dataset.p;inp.dispatchEvent(new Event('input'));send()};
-function stopGen(){st.abort?.abort();fetch('/api/stop',{method:'POST'}).catch(()=>{})}
-function regenerate(){
- const c=st.cur;
- // drop trailing assistant message(s) until we hit a user message
- while(c.msgs.length&&c.msgs[c.msgs.length-1].role!=='user')c.msgs.pop();
- rt();runAgent()}
-async function send(){
- const text=inp.value.trim();if(!text||st.busy)return;
- inp.value='';inp.style.height='auto';
- const c=st.cur;c.msgs.push({role:'user',text,time:now()});
- if(c.title==='New chat'){c.title=text.slice(0,42)+(text.length>42?'…':'');rc()}
- drop();$('#thread').appendChild(me(c.msgs[c.msgs.length-1],c.msgs.length-1));$('#chatTitle').textContent=c.title;
- sb.disabled=!inp.value.trim();
- await runAgent()}
-async function runAgent(){
- const c=st.cur;
- const am={role:'assistant',text:'',time:now()};c.msgs.push(am);
- const el=me(am,c.msgs.length-1);$('#thread').appendChild(el);
- const ce=el.querySelector('.ct'),te=el.querySelector('.tools');
- ce.innerHTML='<div class="pw"><div class="pu"></div>'+(cfg.deepResearch?'Researching…':'Thinking…')+'</div>';sd();
- st.busy=true;sb.classList.add('stop');sb.textContent='■';sb.disabled=false;
- st.abort=new AbortController();
- const cards={};
- const hist=c.msgs.filter(m=>m.text&&m!==am).map(m=>({role:m.role==='user'?'user':'assistant',content:m.text}));
- try{
-  const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({cfg,messages:hist}),signal:st.abort.signal});
-  if(r.status===403){const j=await r.json();throw new Error(j.error||'Access denied')}
-  const rd=r.body.getReader(),dc=new TextDecoder();let buf='';
-  while(true){const{done,value}=await rd.read();if(done)break;
-   buf+=dc.decode(value,{stream:true});const ps=buf.split('\n\n');buf=ps.pop();
-   for(const p of ps){const l=p.replace(/^data:\s*/,'').trim();if(!l)continue;
-    let ev;try{ev=JSON.parse(l)}catch(e){continue}
-    if(ev.type==='token'){am.text+=ev.text;ce.innerHTML=md(am.text)+'<span class="cur"></span>';sd(true)}
-    else if(ev.type==='always_allow'){
-     if(ev.flag==='confirmShell')cfg.confirmShell=false;
-     if(ev.flag==='confirmWrite')cfg.confirmWrite=false;
-     save();sUI();toast('Always-allow saved for this tool type')}
-    else if(ev.type==='tool'){
-     if(!am.text)ce.innerHTML='';
-     let cd=cards[ev.id];
-     if(!cd){cd=document.createElement('div');cd.className='tc'+(cfg.expandTools?' open':'');cards[ev.id]=cd;te.appendChild(cd)}
-     cd.dataset.det=ev.detail||'';
-     const h=`<span>${IC[ev.tool]||'🔧'}</span><b>${ev.tool}</b><span class="det">${esc(ev.detail||'')}</span>`;
-     if(ev.status==='gen')
-      cd.innerHTML=`<div class="th">${h}<span style="margin-left:auto;font-size:11px;color:var(--dim)">generating</span><div class="sp" style="margin-left:8px"></div></div>`;
-     else if(ev.status==='confirm'){
-      const flagLabel=ev.tool==='shell'?'shell commands':'file writes';
-      cd.innerHTML=`<div class="th">${h}<div class="tconf">
-       <label><input type="checkbox" class="always"> always allow ${flagLabel}</label>
-       <button class="n" data-a="0">Deny</button><button class="y" data-a="1">Approve</button></div></div>`;
-      cd.querySelector('.tconf').onclick=async e2=>{const b=e2.target.closest('button');if(!b)return;
-       const always=cd.querySelector('.always')?.checked||false;
-       cd.querySelector('.tconf').outerHTML=b.dataset.a==='1'?'<div class="sp"></div>':'<span class="ok2 bad">denied</span>';
-       await fetch('/api/approve',{method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({id:ev.id,approved:b.dataset.a==='1',always})})}}
-     else cd.innerHTML=`<div class="th">${h}<div class="sp"></div></div>`;
-     sd(true)}
-    else if(ev.type==='tool_progress'){const cd=cards[ev.id];if(!cd)continue;
-     const d=cd.querySelector('.det');
-     if(d)d.textContent=(cd.dataset.det||'')+' · '+(ev.size/1024).toFixed(1)+' KB';sd(true)}
-    else if(ev.type==='tool_end'){const cd=cards[ev.id];if(!cd)continue;
-     const h=cd.querySelector('.th');h.querySelector('.sp')?.remove();h.querySelector('.tconf')?.remove();
-     if(!h.querySelector('.ok2'))h.insertAdjacentHTML('beforeend',`<span class="ok2 ${ev.ok?'':'bad'}">${ev.ok?'✓':'✕'}</span>`);
-     if(ev.output){const b=document.createElement('div');b.className='tb';
-      b.innerHTML=`<button class="cpo">copy</button>`;b.appendChild(document.createTextNode(ev.output));
-      b.querySelector('.cpo').onclick=ev2=>{ev2.stopPropagation();navigator.clipboard?.writeText(ev.output);toast('Output copied')};
-      cd.appendChild(b);
-      h.onclick=()=>cd.classList.toggle('open')}
-     sd(true)}
-    else if(ev.type==='error')am.text+=(am.text?'\n\n':'')+'⚠️ '+ev.text}}
- }catch(e){if(e.name!=='AbortError'){am.text+=(am.text?'\n\n':'')+'⚠️ '+
-  (e.message&&e.message!=='Failed to fetch'?e.message:
-   (st.online?'Connection error':'Model offline — start '+(PLAT[cfg.platform]||'your runtime')+' and reconnect via ⚙.'));
-  toast('Error: '+(e.message||(st.online?'Connection error':'Model offline')),'err')}}
- ce.innerHTML=md(am.text)||'<span style="color:var(--dim)">［stopped］</span>';
- st.busy=false;sb.classList.remove('stop');sb.textContent='➤';sb.disabled=!inp.value.trim();
- saveC();sd();
- // re-render to attach the regenerate button to the now-final message
- rt()}
-function sUI(){
- $$('#themeSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===cfg.theme));
- $$('#sw .swb').forEach(s=>s.classList.toggle('sel',s.dataset.c===cfg.accent));
- $('#fsz').value=cfg.fontSize;
- $$('#widthSeg button').forEach(b=>b.classList.toggle('on',b.dataset.v===cfg.width));
- $('#tsTgl').classList.toggle('on',cfg.timestamps);$('#expTgl').classList.toggle('on',cfg.expandTools);
- $('#nm').value=cfg.userName;$('#sp').value=cfg.sysPrompt;
- $('#tp').value=cfg.temp;$('#tv').textContent=(+cfg.temp).toFixed(1);
- $('#shT').classList.toggle('on',cfg.confirmShell);$('#wrT').classList.toggle('on',cfg.confirmWrite);
- $('#connInfo').innerHTML=`${PLAT[cfg.platform]}<span class="s2">${esc(cfg.baseUrl)}</span>`;dr()}
-$('#gearBtn').onclick=()=>{sUI();pollAccess();$('#setOv').classList.add('show')};
-$('#xSet').onclick=()=>$('#setOv').classList.remove('show');
-$('#setOv').onclick=e=>{if(e.target===e.currentTarget)e.currentTarget.classList.remove('show')};
-$('#themeSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;cfg.theme=b.dataset.v;save();theme();sUI()};
-$('#sw').onclick=e=>{const s=e.target.closest('.swb');if(!s)return;cfg.accent=s.dataset.c;save();theme();sUI()};
-$('#fsz').oninput=e=>{cfg.fontSize=+e.target.value;save();theme()};
-$('#widthSeg').onclick=e=>{const b=e.target.closest('button');if(!b)return;cfg.width=b.dataset.v;save();theme();sUI()};
-$('#tsTgl').onclick=()=>{cfg.timestamps=!cfg.timestamps;save();theme();sUI()};
-$('#expTgl').onclick=()=>{cfg.expandTools=!cfg.expandTools;save();sUI()};
-$('#shT').onclick=()=>{cfg.confirmShell=!cfg.confirmShell;save();sUI()};
-$('#wrT').onclick=()=>{cfg.confirmWrite=!cfg.confirmWrite;save();sUI()};
-$('#nm').onchange=e=>{cfg.userName=e.target.value.trim()||'user';save();
- $('#heroGreet').textContent=`How can I help, ${cfg.userName}?`};
-$('#sp').onchange=e=>{cfg.sysPrompt=e.target.value;save()};
-$('#tp').oninput=e=>{cfg.temp=+e.target.value;$('#tv').textContent=cfg.temp.toFixed(1);save()};
-$('#exportBtn').onclick=()=>{
- const blob=new Blob([JSON.stringify(st.cur,null,2)],{type:'application/json'});
- const a=document.createElement('a');a.href=URL.createObjectURL(blob);
- a.download=(st.cur.title||'chat').replace(/[^\w-]+/g,'_')+'.json';a.click();
- setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
-$('#reconfig').onclick=()=>{$('#setOv').classList.remove('show');$('#app').classList.remove('active');
- $('#platform').value=cfg.platform;$('#platform').dispatchEvent(new Event('change'));
- $('#setupOv').classList.add('show');goStep(1)};
-function toast(t,ty){const d=document.createElement('div');d.className='tst';d.textContent=t;
- const c=$('#toast');c.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transform='translateY(10px)';
- setTimeout(()=>d.remove(),250)},2200)}
-})();
-</script><div id="toast"></div></body></html>"""
+def code_mode(task: str):
+    print(); rule("═", C.CYAN)
+    print(f"  {c(C.CYAN+C.B,'⌨  CODE MODE')}  {c(C.WHT, task)}")
+    rule("═", C.CYAN)
+    info(f"max iters={CODE_MAX_ITER}  timeout={SANDBOX_TIMEOUT}s  memory=ON")
+    print()
+
+    code_mem = load_code_memory()
+    messages: list[dict] = [
+        {"role": "system", "content": code_agent_prompt(task, code_mem)},
+        {"role": "user",   "content": task},
+    ]
+
+    last_pass   = False
+    files_used: list[str] = []
+    outcome     = "incomplete"
+
+    for iteration in range(CODE_MAX_ITER * MAX_TOOL_LOOPS):
+        reply = run_inference(messages)
+        if not reply: break
+        messages.append({"role": "assistant", "content": reply})
+        tool_used, tool_result, tool_name = process_tools(reply)
+
+        if tool_used:
+            # Track files modified
+            if tool_name in ("write","patch","edit","append"):
+                m = re.search(r'(?:Wrote|Patched|Appended|Replaced)\s+\S+\s+.*?→\s+(\S+)', tool_result)
+                if m: files_used.append(m.group(1))
+
+            if tool_name == "test":
+                passed = "PASS" in tool_result or "exit 0" in tool_result
+                last_pass = passed
+                label = c(C.GREEN if passed else C.RED, "PASS" if passed else "FAIL")
+                print(f"\n  {c(C.CYAN+C.DIM, f'iter {iteration+1}')} test {label}")
+                if passed:
+                    outcome = "success"
+                    messages.append({"role": "user", "content":
+                        f"[Test PASS]\n{tool_result}\n\n"
+                        "Write REPORT: what was built, how to use it, any caveats."})
+                    report = run_inference(messages)
+                    if report:
+                        messages.append({"role": "assistant", "content": report})
+                        outcome = report[:300]
+                    break
+                else:
+                    messages.append({"role": "user", "content":
+                        f"[Test FAIL — iter {iteration+1}/{CODE_MAX_ITER}]\n{tool_result}\n\n"
+                        "Read the error carefully. Diagnose. Patch ONLY the broken part. "
+                        "Do not rewrite the whole file unless the architecture is wrong."})
+            else:
+                messages.append({"role": "user", "content":
+                    f"[{tool_name}]\n{tool_result}\n\nContinue."})
+        else:
+            done_words = {"complete","done","finished","report","built","summary","usage"}
+            if any(w in reply.lower() for w in done_words):
+                outcome = reply[:300]; break
+            messages.append({"role": "user", "content":
+                "Use a tool for the next step. Do not describe — act."})
+
+    # Persist session to code memory
+    update_code_memory(task, outcome, files_used)
+
+    print(); rule("─", C.CYAN)
+    s = c(C.GREEN,"✓ tests passed") if last_pass else c(C.YEL,"⚠ done (no passing test)")
+    print(f"  {c(C.CYAN+C.B,'⌨  CODE DONE')}  {s}")
+    rule("─", C.CYAN); print()
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BANNER & PROMPT
+# ═══════════════════════════════════════════════════════════════════════
+
+def check_ollama() -> tuple[bool | None, list[str]]:
+    try:
+        r = requests.get(TAGS_URL, timeout=3)
+        models = [m["name"] for m in r.json().get("models", [])]
+        ok_f = (cfg["model"] in models or
+                any(cfg["model"].split(":")[0] in m for m in models))
+        return ok_f, models
+    except Exception: return None, []
+
+def banner():
+    print()
+    print(f"  {c(C.CYAN+C.B,'ARIA')} {c(C.GRAY, VERSION)}  {c(C.DGRAY,'·  Autonomous Reasoning Intelligent Agent')}")
+    rule()
+    online, models = check_ollama()
+    if online is None:   ms = c(C.RED,'✗ ollama offline')
+    elif not online:
+        avail = ", ".join(models[:4]) or "none"
+        ms = c(C.YEL, f'⚠ model not found  (available: {avail})')
+    else: ms = c(C.GREEN,'✓ ready')
+    dot = lambda f: c(C.GREEN if f else C.GRAY, '●')
+    print(f"  {c(C.GRAY,'model')}   {c(C.WHT, cfg['model'])}  {ms}")
+    print(f"  {c(C.GRAY,'access')}  shell {dot(cfg['allow_shell'])}  net {dot(cfg['allow_network'])}  write {dot(cfg['allow_write'])}  auto {dot(cfg['autonomous'])}")
+    code_mem = load_code_memory()
+    if sessions := code_mem.get("sessions", []):
+        print(f"  {c(C.GRAY,'code mem')} {c(C.DGRAY, f'{len(sessions)} past sessions')}")
+    if _plugins:
+        print(f"  {c(C.GRAY,'plugins')} {c(C.CYAN, '  '.join(_plugins.keys()))}")
+    rule()
+    info("type /help  ·  /code <task> for code agent  ·  ↑↓ history")
+    print()
+
+def prompt_line() -> str:
+    ws  = workspace()
+    ws_s = f" {c(C.DGRN, ws)}" if ws else ""
+    return (f"\n  {c(C.GRAY+C.DIM, f'#{_msg_count+1}')} {c(C.GRAY+C.DIM, Path.cwd().name)}{ws_s}\n"
+            f"  {c(C.GREEN+C.B,'▶')} {c(C.WHT+C.B,'you')}: ")
+
+# ═══════════════════════════════════════════════════════════════════════
+#  STATUS & HELP
+# ═══════════════════════════════════════════════════════════════════════
+
+def show_status():
+    _, models = check_ollama()
+    code_mem  = load_code_memory()
+    print(); rule()
+    print(f"  {c(C.CYAN+C.B,'ARIA')} {c(C.GRAY, VERSION)}  ·  {uptime()} uptime")
+    rule()
+    rows = [
+        ("model",        cfg["model"]),
+        ("messages",     str(_msg_count)),
+        ("tokens",       f"{_token_total:,}"),
+        ("cwd",          os.getcwd()),
+        ("shell",        str(cfg["allow_shell"])),
+        ("network",      str(cfg["allow_network"])),
+        ("write",        str(cfg["allow_write"])),
+        ("auto",         str(cfg["autonomous"])),
+        ("compress",     str(cfg["auto_compress"])),
+        ("notes",        str(len(_notes))),
+        ("code sessions",str(len(code_mem.get("sessions",[])))),
+        ("plugins",      ", ".join(_plugins.keys()) or "none"),
+    ]
+    for k, v in rows:
+        vc = C.GREEN if v.lower()=='true' else (C.GRAY if v.lower()=='false' else C.WHT)
+        print(f"  {c(C.GRAY, k.ljust(14))} {c(vc, v)}")
+    if _tool_counts:
+        print(f"\n  {c(C.GRAY,'tools used:')}")
+        for t, n in sorted(_tool_counts.items(), key=lambda x: -x[1]):
+            print(f"  {c(C.CYAN, t.ljust(14))} {c(C.WHT, str(n))}")
+    if models:
+        print(f"\n  {c(C.GRAY,'available models:')}")
+        for m in models[:8]:
+            mark = c(C.GREEN," ←") if cfg["model"].split(":")[0] in m else ""
+            print(f"  {c(C.GRAY,'  '+m)}{mark}")
+    rule(); print()
+
+def show_help():
+    cmds = [
+        ("/exit",              "Exit ARIA"),
+        ("/clear",             "Clear conversation history"),
+        ("/code [task]",       "Coding agent with memory"),
+        ("/auto [on|off]",     "Toggle autonomous loop"),
+        ("/model <name>",      "Switch model"),
+        ("/allow <feat> <on>", "Toggle shell/network/write"),
+        ("/temp <0.0-1.0>",    "Set temperature"),
+        ("/compress",          "Compress history now"),
+        ("/status",            "Session stats"),
+        ("/ls [path]",         "List directory"),
+        ("/tree [path]",       "Directory tree"),
+        ("/pwd",               "Working directory"),
+        ("/note <text>",       "Add a note"),
+        ("/notes",             "List notes"),
+        ("/memory",            "Show persistent memory"),
+        ("/diff <f1> <f2>",    "Diff two files"),
+        ("/undo",              "List backups"),
+        ("/codemem",           "Show code mode memory"),
+        ("/explain",           "Explain last tool result"),
+        ("/save",              "Save session"),
+        ("/load [file]",       "Load session"),
+        ("/reconfigure",       "Re-run setup"),
+        ("/plugins",           "List plugins"),
+        ("/help",              "This screen"),
+    ]
+    print(); rule()
+    print(f"  {c(C.CYAN+C.B,'Commands')}")
+    rule()
+    for cmd, desc in cmds:
+        print(f"  {c(C.WHT+C.B, cmd.ljust(24))} {c(C.GRAY, desc)}")
+    rule()
+    info("↑↓ history  ·  Tab completion  ·  Ctrl+C interrupt  ·  Ctrl+D exit")
+    print()
+
+def show_exit_stats():
+    print(); rule()
+    print(f"  {c(C.CYAN,'Session')}  msgs={_msg_count}  tokens={_token_total:,}  uptime={uptime()}  tools={sum(_tool_counts.values())}")
+    rule(); print(f"  {c(C.GRAY+C.DIM,'goodbye ✦')}"); print()
+
+# ═══════════════════════════════════════════════════════════════════════
+#  COMMAND HANDLER
+# ═══════════════════════════════════════════════════════════════════════
+
+def handle_command(line: str) -> str | None:
+    parts = line.split(); verb = parts[0].lower()
+
+    if verb == '/exit':
+        show_exit_stats(); save_readline_history(); save_notes(); sys.exit(0)
+
+    elif verb == '/clear': return "clear"
+
+    elif verb == '/compress':
+        messages_history[:] = compress_history(messages_history)
+        ok(f"History: {len(messages_history)} messages")
+
+    elif verb == '/code':
+        task = " ".join(parts[1:]) or input(f"  {c(C.YEL,'Task:')} ").strip()
+        if task: code_mode(task)
+        else: warn("No task specified.")
+
+    elif verb == '/auto':
+        if len(parts) > 1:
+            cfg['autonomous'] = parts[1].lower() in ('true','1','yes','on')
+            save_config(); ok(f"Autonomous: {'ON' if cfg['autonomous'] else 'OFF'}")
+        else: ok(f"Autonomous: {'ON' if cfg['autonomous'] else 'OFF'}")
+
+    elif verb == '/temp':
+        if len(parts) > 1:
+            try:
+                cfg['temperature'] = max(0.0, min(1.0, float(parts[1])))
+                save_config(); ok(f"Temperature → {cfg['temperature']}")
+            except ValueError: warn("Usage: /temp 0.3")
+        else: ok(f"Temperature: {cfg['temperature']}")
+
+    elif verb == '/ls':
+        result, ok_f = tool_listdir(parts[1] if len(parts) > 1 else ".")
+        print(); result_box(result, ok_f)
+
+    elif verb == '/tree':
+        result, ok_f = tool_tree(parts[1] if len(parts) > 1 else ".")
+        print(); result_box(result, ok_f)
+
+    elif verb == '/pwd': ok(os.getcwd())
+
+    elif verb == '/status': show_status()
+
+    elif verb == '/model':
+        if len(parts) > 1: cfg['model'] = parts[1]; save_config(); ok(f"Model → {parts[1]}")
+        else:
+            _, models = check_ollama()
+            for m in models:
+                mark = c(C.GREEN," ←") if cfg["model"].split(":")[0] in m else ""
+                print(f"  {c(C.GRAY, m)}{mark}")
+
+    elif verb == '/allow':
+        if len(parts) == 3 and parts[1].lower() in ('shell','network','write'):
+            feat = parts[1].lower(); val = parts[2].lower() in ('true','1','yes','on')
+            cfg[f'allow_{feat}'] = val; save_config()
+            ok(f"{feat}: {'ON' if val else 'OFF'}")
+            if feat == 'shell' and val: warn("Shell enabled — dangerous patterns still blocked.")
+        else: warn("Usage: /allow <shell|network|write> <on|off>")
+
+    elif verb == '/reconfigure':
+        first_time_setup()
+        if messages_history and messages_history[0]["role"] == "system":
+            messages_history[0]["content"] = build_system_prompt()
+        ok("System prompt refreshed.")
+
+    elif verb == '/save':
+        sf = SESSION_DIR / f"session_{int(time.time())}.json"
+        try:
+            sf.write_text(json.dumps({"ts": time.time(), "messages": messages_history,
+                                       "cfg": cfg, "cwd": os.getcwd()}, indent=2))
+            ok(f"Saved → {sf.name}")
+        except Exception as e: err(f"Save failed: {e}")
+
+    elif verb == '/load':
+        if len(parts) < 2:
+            sessions = sorted(SESSION_DIR.glob("*.json"), reverse=True)[:10]
+            if not sessions: warn("No saved sessions.")
+            else:
+                for s in sessions:
+                    ts = s.stem.replace("session_","")
+                    print(f"  {c(C.CYAN, s.name)}  {c(C.GRAY, datetime.datetime.fromtimestamp(int(ts)).strftime('%Y-%m-%d %H:%M'))}")
+            return None
+        sf = Path(parts[1]); sf = sf if sf.exists() else SESSION_DIR / parts[1]
+        if not sf.exists(): err("Session not found."); return None
+        try:
+            data = json.loads(sf.read_text())
+            messages_history[:] = data.get("messages", []); cfg.update(data.get("cfg", {}))
+            if (cwd := data.get("cwd")) and Path(cwd).exists(): os.chdir(cwd)
+            ok(f"Loaded: {sf.name}"); return "load"
+        except Exception as e: err(f"Load failed: {e}")
+
+    elif verb == '/note':
+        text = " ".join(parts[1:])
+        if text: tool_note(text)
+        else: warn("Usage: /note <text>")
+
+    elif verb == '/notes':
+        result, _ = tool_notes_list(); print(); result_box(result, True)
+
+    elif verb == '/memory':
+        mem = load_memory()
+        if mem:
+            print()
+            for k, v in mem.items(): print(f"  {c(C.CYAN, k)}  {c(C.GRAY, str(v))}")
+        else: info("Memory is empty.")
+
+    elif verb == '/codemem':
+        mem = load_code_memory()
+        sessions = mem.get("sessions", [])
+        if not sessions: info("No code sessions yet.")
+        else:
+            print()
+            for s in sessions[-10:]:
+                print(f"  {c(C.CYAN, s['time'][:10])}  {c(C.WHT, s['task'][:60])}")
+                print(f"    {c(C.GRAY, s['outcome'][:80])}")
+                if s.get('files'): print(f"    {c(C.DGRAY, 'files: '+', '.join(s['files'][:4]))}")
+
+    elif verb == '/diff':
+        if len(parts) < 3: warn("Usage: /diff <file1> <file2>")
+        else:
+            result, ok_f = tool_diff(parts[1], parts[2])
+            print(); result_box(result, ok_f)
+            if ok_f: diff_box(result)
+
+    elif verb == '/undo':
+        baks = sorted(BACKUP_DIR.glob("*.bak"), key=lambda p: p.stat().st_mtime, reverse=True)[:15]
+        if not baks: info("No backups found.")
+        else:
+            for b in baks:
+                ts = datetime.datetime.fromtimestamp(b.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"  {c(C.CYAN, b.name)}  {c(C.GRAY, ts)}  {c(C.DGRAY, f'{b.stat().st_size:,}B')}")
+            info("Restore: cp ~/.aria_backups/<file> <destination>")
+
+    elif verb == '/plugins':
+        if _plugins:
+            for name, ns in _plugins.items():
+                desc = ns.get("__doc__") or ns.get("DESCRIPTION","(no description)")
+                print(f"  {c(C.CYAN, name)}  {c(C.GRAY, str(desc)[:60])}")
+        else: info(f"No plugins. Add .py files to {PLUGINS_DIR}")
+
+    elif verb == '/explain':
+        if _last_tool_result:
+            run_inference([
+                {"role":"system","content":"You are ARIA. Explain this tool output clearly and concisely. What does it mean? Any issues to note?"},
+                {"role":"user","content": _last_tool_result[:3000]},
+            ])
+        else: info("No tool result to explain.")
+
+    elif verb == '/help': show_help()
+
+    else:
+        suggestion = difflib.get_close_matches(verb, _CMDS, n=1, cutoff=0.55)
+        if suggestion: warn(f"Unknown: {verb} — did you mean {c(C.CYAN, suggestion[0])}?")
+        else: warn(f"Unknown command: {verb}  (try /help)")
+
+    return None
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FIRST-TIME SETUP & CRASH RECOVERY
+# ═══════════════════════════════════════════════════════════════════════
+
+def first_time_setup():
+    print(f"\n  {c(C.CYAN+C.B,'✨ First-time setup')}"); rule()
+    cfg["browser_cmd"] = input(f"  {c(C.YEL,'Browser')} {c(C.GRAY,'[firefox]:')} ").strip() or "firefox"
+    cfg["editor_cmd"]  = input(f"  {c(C.YEL,'Editor')}  {c(C.GRAY,'[code]:')} ").strip() or "code"
+    cfg["allow_shell"] = input(f"  {c(C.YEL,'Enable shell?')} {c(C.GRAY,'(yes/no) [no]:')} ").strip().lower() in ('yes','y')
+    cfg["fallback_model"] = input(f"  {c(C.YEL,'Fallback model')} {c(C.GRAY,'(blank=none):')} ").strip()
+    Path(cfg["projects_dir"]).mkdir(parents=True, exist_ok=True)
+    save_config(); rule()
+    ok(f"Saved.  Shell: {'ON' if cfg['allow_shell'] else 'OFF'}")
+    time.sleep(0.3)
+
+def check_crash_recovery():
+    if not CRASH_FILE.exists(): return
+    try:
+        data = json.loads(CRASH_FILE.read_text())
+        msgs = data.get("messages", [])
+        age  = time.time() - CRASH_FILE.stat().st_mtime
+        if not msgs or age > 21600: CRASH_FILE.unlink(missing_ok=True); return
+        dt_str = datetime.datetime.fromtimestamp(CRASH_FILE.stat().st_mtime).strftime("%H:%M:%S")
+        warn(f"Crash recovery available from {dt_str} ({len(msgs)} messages)")
+        if input(f"  {c(C.YEL,'Restore? (y/N):')} ").strip().lower() in ('y','yes'):
+            messages_history[:] = msgs; cfg.update(data.get("cfg", {})); ok("Restored.")
+        CRASH_FILE.unlink(missing_ok=True)
+    except Exception: pass
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
+
+def main():
+    load_config(); load_notes(); load_plugins(); setup_readline()
+    if not CONFIG_FILE.exists(): first_time_setup()
+    banner(); check_crash_recovery()
+    messages_history.append({"role": "system", "content": build_system_prompt()})
+
+    while True:
+        try:
+            user_input = input(prompt_line()).strip()
+            if not user_input: continue
+
+            if user_input.startswith('/'):
+                result = handle_command(user_input)
+                if result == "clear":
+                    messages_history.clear()
+                    messages_history.append({"role": "system", "content": build_system_prompt()})
+                    ok("History cleared.")
+                elif result == "load":
+                    if messages_history and messages_history[0]["role"] == "system":
+                        messages_history[0]["content"] = build_system_prompt()
+                continue
+
+            messages_history.append({"role": "user", "content": user_input})
+
+            if cfg.get("autonomous", True):
+                autonomous_loop(messages_history)
+            else:
+                reply = run_inference(messages_history)
+                if reply:
+                    messages_history.append({"role": "assistant", "content": reply})
+                    tool_used, tool_result, tool_name = process_tools(reply)
+                    if tool_used:
+                        messages_history.append({"role": "user", "content":
+                            f"[{tool_name} result]\n{tool_result}\n\nContinue or give final answer."})
+
+        except KeyboardInterrupt:
+            print(f"\n  {c(C.GRAY+C.DIM,'interrupted  ·  /exit to quit')}")
+        except EOFError:
+            show_exit_stats(); save_readline_history(); save_notes(); break
+
 
 if __name__ == "__main__":
-    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"✦ Aria → http://127.0.0.1:{PORT}")
-    print(f"  Workspace: {ROOT}")
-    print(f"  LAN: other devices on your network can connect to http://<this-machine-ip>:{PORT}")
-    print(f"        (the first device to load the page becomes the trusted host;")
-    print(f"         other devices need to be approved from the host's Settings)")
-    threading.Timer(0.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nStopped.")
+    main()
