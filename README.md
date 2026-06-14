@@ -1,4 +1,4 @@
-# ✦ Aria — Autonomous Reasoning Intelligent Agent
+<img width="2560" height="1299" alt="image" src="https://github.com/user-attachments/assets/a2f44d0e-6365-45de-9cae-23be3f67b4aa" /># ✦ Aria — Autonomous Reasoning Intelligent Agent
 
 A local AI agent with a clean web UI.
 
@@ -62,3 +62,5 @@ The tool system is designed to be extended. To add a new tool:
 ## License
 
 Free as in speech. Free as in beer. Do whatever you want with it.
+<img width="2560" height="1299" alt="image" src="https://github.com/user-attachments/assets/1a6bd67b-c301-499e-a904-a89317cf6edb" />
+
